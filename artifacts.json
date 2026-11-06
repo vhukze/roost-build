@@ -1,18 +1,32 @@
 {
-  "$schema": "https://json-schema.org/draft-07/schema#",
-  "version": 1,
+  "version": 2,
   "updated": "2026-11-06T00:00:00Z",
   "note": "Roost 云端产物清单。终端用户无需编译，App 读取此文件后直接下载现成二进制。",
+
+  "build_matrix": {
+    "explain": "内核按「内核版本 × 是否集成 KSU」编译，不需要按 Android 版本逐个编。",
+    "arch": ["arm64-v8a", "x86_64"],
+    "note": "Google 预编译镜像自带匹配内核，仅 KernelSU/APatch 需要自编译内核"
+  },
+
+  "android_kernel_requirements": [
+    { "android": "11", "api": 30, "min_kernel": "4.14", "recommended": "4.14" },
+    { "android": "12", "api": 31, "min_kernel": "4.19", "recommended": "5.10" },
+    { "android": "13", "api": 33, "min_kernel": "5.10", "recommended": "5.10" },
+    { "android": "14", "api": 34, "min_kernel": "5.15", "recommended": "5.15" },
+    { "android": "15", "api": 35, "min_kernel": "6.1", "recommended": "6.1" },
+    { "android": "16", "api": 36, "min_kernel": "6.1", "recommended": "6.6" }
+  ],
 
   "kernels": [
     {
       "id": "goldfish-4.14-ranchu",
-      "name": "goldfish 4.14 ranchu",
-      "description": "AOSP 模拟器专用内核，兼容 API 30-34，支持 Magisk system 模式",
+      "name": "goldfish 4.14 (无 KSU)",
+      "description": "AOSP 模拟器专用内核，兼容 API 30-31。Magisk 用户无需此内核，仅当官方镜像内核损坏时备选。",
       "kernel_version": "4.14",
       "defconfig": "ranchu_defconfig",
       "api_min": 30,
-      "api_max": 34,
+      "api_max": 31,
       "has_ksu": false,
       "url": "",
       "sha256": "",
@@ -22,12 +36,57 @@
     },
     {
       "id": "goldfish-4.14-ranchu-ksu",
-      "name": "goldfish 4.14 ranchu + KernelSU",
-      "description": "集成 KernelSU 的内核，支持内核态 root 与模块系统",
+      "name": "goldfish 4.14 + KernelSU",
+      "description": "集成 KernelSU 内核态 root，适用于 API 30-31 虚拟机",
       "kernel_version": "4.14",
       "defconfig": "ranchu_defconfig",
       "api_min": 30,
+      "api_max": 31,
+      "has_ksu": true,
+      "url": "",
+      "sha256": "",
+      "size": "",
+      "status": "not-built",
+      "build_run": ""
+    },
+    {
+      "id": "gki-5.10-ksu",
+      "name": "GKI 5.10 + KernelSU",
+      "description": "适用于 API 32-33 的 GKI 内核，集成 KernelSU",
+      "kernel_version": "5.10",
+      "defconfig": "gki_defconfig",
+      "api_min": 32,
+      "api_max": 33,
+      "has_ksu": true,
+      "url": "",
+      "sha256": "",
+      "size": "",
+      "status": "not-built",
+      "build_run": ""
+    },
+    {
+      "id": "gki-5.15-ksu",
+      "name": "GKI 5.15 + KernelSU",
+      "description": "适用于 API 33-34 的 GKI 内核，集成 KernelSU（推荐）",
+      "kernel_version": "5.15",
+      "defconfig": "gki_defconfig",
+      "api_min": 33,
       "api_max": 34,
+      "has_ksu": true,
+      "url": "",
+      "sha256": "",
+      "size": "",
+      "status": "not-built",
+      "build_run": ""
+    },
+    {
+      "id": "gki-6.1-ksu",
+      "name": "GKI 6.1 + KernelSU",
+      "description": "适用于 API 34-35 的 GKI 内核，集成 KernelSU",
+      "kernel_version": "6.1",
+      "defconfig": "gki_defconfig",
+      "api_min": 34,
+      "api_max": 35,
       "has_ksu": true,
       "url": "",
       "sha256": "",
@@ -46,6 +105,7 @@
       "source": "google",
       "url": "https://dl.google.com/android/repository/sys-img/google_apis/arm64-v8a-34_r14.zip",
       "size": "1.50 GB",
+      "bundled_kernel": "5.15",
       "note": "Google 官方预编译，含 kernel + system.img + vendor.img"
     },
     {
@@ -56,6 +116,7 @@
       "source": "google",
       "url": "https://dl.google.com/android/repository/sys-img/google_apis/arm64-v8a-33_r17.zip",
       "size": "1.64 GB",
+      "bundled_kernel": "5.10",
       "note": "Google 官方预编译"
     },
     {
@@ -66,7 +127,19 @@
       "source": "google",
       "url": "https://dl.google.com/android/repository/sys-img/google_apis/arm64-v8a-31_r11.zip",
       "size": "1.32 GB",
+      "bundled_kernel": "5.10",
       "note": "Google 官方预编译，体积较小"
+    },
+    {
+      "id": "aosp-api30-arm64",
+      "name": "Android 11 (API 30)",
+      "api": 30,
+      "abi": "arm64-v8a",
+      "source": "google",
+      "url": "https://dl.google.com/android/repository/sys-img/google_apis/arm64-v8a-30_r16.zip",
+      "size": "1.16 GB",
+      "bundled_kernel": "4.14",
+      "note": "kernel 为 goldfish 4.14，可被自编译内核替换"
     }
   ],
 
