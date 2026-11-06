@@ -1,0 +1,148 @@
+name: Publish Artifact Manifest
+
+# 内核编译完成后，自动把产物信息写回 artifacts.json
+# 终端用户 App 读取该清单即可知道去哪里下载现成内核
+
+on:
+  workflow_run:
+    workflows: ["Build AOSP arm64 Kernel"]
+    types: [completed]
+
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "编译 run ID（留空则取最近一次成功的）"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 定位编译产物
+        id: locate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MANUAL_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -e
+
+          if [ -n "$MANUAL_RUN_ID" ]; then
+            RUN_ID="$MANUAL_RUN_ID"
+          else
+            RUN_ID="${{ github.event.workflow_run.id }}"
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+          echo "=== 查询 Release ==="
+          TAG=$(gh release list --limit 20 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[0].tagName')
+
+          echo "最新 Release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          echo "=== Release 资产 ==="
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)  \(.size) bytes"'
+
+          KERNEL_URL=$(gh release view "$TAG" --json assets \
+            --jq '.assets[] | select(.name=="kernel") | .url')
+          SHA_URL=$(gh release view "$TAG" --json assets \
+            --jq '.assets[] | select(.name=="kernel.sha256") | .url')
+          INFO_URL=$(gh release view "$TAG" --json assets \
+            --jq '.assets[] | select(.name=="build-info.txt") | .url')
+
+          echo "kernel_url=$KERNEL_URL" >> "$GITHUB_OUTPUT"
+          echo "sha_url=$SHA_URL" >> "$GITHUB_OUTPUT"
+          echo "info_url=$INFO_URL" >> "$GITHUB_OUTPUT"
+
+      - name: 下载产物信息
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mkdir -p .meta
+          TAG="${{ steps.locate.outputs.tag }}"
+
+          gh release download "$TAG" --pattern "kernel.sha256" --dir .meta
+          gh release download "$TAG" --pattern "build-info.txt" --dir .meta
+
+          echo "=== kernel.sha256 ==="
+          cat .meta/kernel.sha256
+
+          echo ""
+          echo "=== build-info.txt ==="
+          cat .meta/build-info.txt
+
+      - name: 更新 artifacts.json
+        id: update
+        run: |
+          set -e
+          TAG="${{ steps.locate.outputs.tag }}"
+          SHA=$(awk '{print $1}' .meta/kernel.sha256)
+          DEFCONFIG=$(grep '^KERNEL_TYPE=' .meta/build-info.txt | cut -d= -f2)
+          KSU=$(grep '^KSU_ENABLED=' .meta/build-info.txt | cut -d= -f2)
+          KVER=$(grep '^KERNEL_VERSION=' .meta/build-info.txt | cut -d= -f2)
+
+          echo "TAG=$TAG  SHA=$SHA  DEFCONFIG=$DEFCONFIG  KSU=$KSU  KVER=$KVER"
+
+          # 选择要更新的条目 id
+          if [ "$KSU" = "true" ]; then
+            ENTRY_ID="goldfish-4.14-ranchu-ksu"
+          else
+            ENTRY_ID="goldfish-4.14-ranchu"
+          fi
+
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/kernel"
+
+          python3 - "$ENTRY_ID" "$DOWNLOAD_URL" "$SHA" "$KVER" "$TAG" <<'PY'
+          import json, sys
+          from datetime import datetime, timezone
+
+          entry_id, url, sha, kver, tag = sys.argv[1:6]
+
+          with open("artifacts.json", encoding="utf-8") as f:
+              data = json.load(f)
+
+          for k in data.get("kernels", []):
+              if k["id"] == entry_id:
+                  k["url"] = url
+                  k["sha256"] = sha
+                  k["kernel_version"] = kver
+                  k["status"] = "ready"
+                  k["build_run"] = tag
+                  print(f"已更新 {entry_id}")
+                  break
+
+          data["updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          with open("artifacts.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+              f.write("\n")
+          PY
+
+          echo "entry_id=$ENTRY_ID" >> "$GITHUB_OUTPUT"
+
+      - name: 提交变更
+        run: |
+          set -e
+          git config user.name "roost-bot"
+          git config user.email "bot@roost.local"
+
+          if git diff --quiet artifacts.json; then
+            echo "清单无变化，跳过提交"
+            exit 0
+          fi
+
+          git add artifacts.json
+          git commit -m "chore: 更新产物清单 (${{ steps.update.outputs.entry_id }})"
+          git push

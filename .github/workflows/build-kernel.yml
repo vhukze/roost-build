@@ -1,0 +1,245 @@
+name: Build AOSP arm64 Kernel
+
+# 为 Roost 编译 AOSP goldfish/ranchu arm64 内核
+# 用途：给 QEMU 虚拟机提供内核，可选集成 KernelSU
+#
+# 说明：
+#   Google 预编译系统镜像已自带可用内核（支持 Magisk system 模式 root）。
+#   本工作流仅在你需要 KernelSU / APatch 这类内核态 root 时使用。
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: "内核分支（goldfish = 模拟器专用，common = GKI 通用）"
+        required: true
+        default: "android-goldfish-4.14-gchips"
+        type: choice
+        options:
+          - android-goldfish-4.14-gchips
+          - android-goldfish-4.14-dev
+          - android13-5.15
+          - android14-6.1
+      defconfig:
+        description: "内核配置"
+        required: true
+        default: "ranchu_defconfig"
+        type: choice
+        options:
+          - ranchu_defconfig
+          - goldfish_defconfig
+          - gki_defconfig
+      enable_ksu:
+        description: "集成 KernelSU"
+        required: true
+        default: false
+        type: boolean
+      ksu_branch:
+        description: "KernelSU 分支（仅 enable_ksu 时生效）"
+        required: false
+        default: "main"
+        type: string
+
+env:
+  KERNEL_REPO: https://android.googlesource.com/kernel/goldfish
+  CLANG_VERSION: clang-r487747c
+  AOSP_MIRROR: https://mirrors.tuna.tsinghua.edu.cn/git/AOSP
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            bc bison build-essential flex libssl-dev libelf-dev \
+            python3 python-is-python3 zip unzip rsync cpio \
+            liblz4-tool git curl device-tree-compiler
+
+      - name: 拉取内核源码
+        env:
+          BRANCH: ${{ inputs.kernel_branch }}
+        run: |
+          set -e
+          echo "=== 拉取内核: $KERNEL_REPO ($BRANCH) ==="
+          git clone --depth=1 -b "$BRANCH" "$KERNEL_REPO" kernel 2>&1 | tail -5 \
+            || git clone --depth=1 "$KERNEL_REPO" kernel
+
+          cd kernel
+          KV="$(sed -n 's/^VERSION = //p' Makefile).$(sed -n 's/^PATCHLEVEL = //p' Makefile).$(sed -n 's/^SUBLEVEL = //p' Makefile)"
+          echo "内核版本: $KV"
+          echo "KERNEL_VER=$KV" >> "$GITHUB_ENV"
+
+          echo ""
+          echo "=== 可用 defconfig ==="
+          ls arch/arm64/configs/ | head -30
+
+      - name: 下载 clang 工具链
+        run: |
+          set -e
+          mkdir -p toolchain
+          echo "=== 下载 clang $CLANG_VERSION ==="
+          # 优先清华镜像
+          URL_PRIMARY="${AOSP_MIRROR}/kernel/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
+          URL_BACKUP="https://android.googlesource.com/kernel/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_VERSION}.tar.gz"
+
+          if curl -fsSL --max-time 600 -o clang.tar.gz "$URL_PRIMARY"; then
+            echo "镜像下载成功"
+          else
+            echo "镜像失败，改用官方源"
+            curl -fsSL --max-time 900 -o clang.tar.gz "$URL_BACKUP"
+          fi
+
+          tar -xzf clang.tar.gz -C toolchain
+          rm clang.tar.gz
+          ls toolchain/bin/ | head -10
+
+          echo "TOOLCHAIN=$PWD/toolchain" >> "$GITHUB_ENV"
+
+      - name: 集成 KernelSU（可选）
+        if: ${{ inputs.enable_ksu }}
+        env:
+          KSU_BRANCH: ${{ inputs.ksu_branch }}
+        run: |
+          set -e
+          echo "=== 集成 KernelSU ($KSU_BRANCH) ==="
+          cd kernel
+
+          # KernelSU 需要配合其提供的 setup 脚本
+          git clone --depth=1 -b "$KSU_BRANCH" https://github.com/tiann/KernelSU.git KernelSU || {
+            echo "KernelSU 拉取失败，跳过"
+            exit 0
+          }
+
+          if [ -f "KernelSU/kernel/setup.sh" ]; then
+            echo "执行 setup.sh"
+            bash KernelSU/kernel/setup.sh || echo "setup.sh 失败，继续尝试手动集成"
+          fi
+
+      - name: 应用 Roost 必需内核配置
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+        run: |
+          set -e
+          cd kernel
+          make ARCH=arm64 "${DEFCONFIG}"
+
+          # 追加 QEMU virt 必需项
+          cat >> .config <<'EOF'
+          CONFIG_VIRTIO=y
+          CONFIG_VIRTIO_PCI=y
+          CONFIG_VIRTIO_BLK=y
+          CONFIG_VIRTIO_NET=y
+          CONFIG_VIRTIO_CONSOLE=y
+          CONFIG_VIRTIO_MMIO=y
+          CONFIG_SCSI_VIRTIO=y
+          CONFIG_DRM_VIRTIO_GPU=y
+          CONFIG_SERIAL_AMBA_PL011=y
+          CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
+          CONFIG_EXT4_FS=y
+          CONFIG_EXT4_FS_POSIX_ACL=y
+          CONFIG_EXT4_FS_SECURITY=y
+          EOF
+
+          # 如果启用了 KSU，确保其配置项存在
+          if [ "${{ inputs.enable_ksu }}" = "true" ]; then
+            cat >> .config <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_KPROBES_HOOK=y
+          EOF
+          fi
+
+          make ARCH=arm64 olddefconfig
+
+          echo ""
+          echo "=== 关键配置校验 ==="
+          for k in CONFIG_VIRTIO_PCI CONFIG_VIRTIO_BLK CONFIG_EXT4_FS CONFIG_SERIAL_AMBA_PL011; do
+            grep -E "^$k=" .config && echo "  [OK] $k" || echo "  [!!] $k 缺失"
+          done
+
+      - name: 编译内核
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+        run: |
+          set -e
+          cd kernel
+          echo "=== 开始编译 ==="
+          make -j"$(nproc)" ARCH=arm64 \
+            CC="${{ env.TOOLCHAIN }}/bin/clang" \
+            LD="${{ env.TOOLCHAIN }}/bin/ld.lld" \
+            AR="${{ env.TOOLCHAIN }}/bin/llvm-ar" \
+            NM="${{ env.TOOLCHAIN }}/bin/llvm-nm" \
+            OBJCOPY="${{ env.TOOLCHAIN }}/bin/llvm-objcopy" \
+            OBJDUMP="${{ env.TOOLCHAIN }}/bin/llvm-objdump" \
+            STRIP="${{ env.TOOLCHAIN }}/bin/llvm-strip" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image.gz 2>&1 | tail -40
+
+          echo ""
+          echo "=== 编译产物 ==="
+          ls -lh arch/arm64/boot/Image.gz 2>/dev/null || ls -lh arch/arm64/boot/
+
+      - name: 打包产物
+        run: |
+          set -e
+          cd kernel
+          mkdir -p ../out
+
+          # 内核本体
+          if [ -f arch/arm64/boot/Image.gz ]; then
+            cp arch/arm64/boot/Image.gz ../out/kernel
+          elif [ -f arch/arm64/boot/Image ]; then
+            cp arch/arm64/boot/Image ../out/kernel
+          fi
+
+          # 内核配置（便于排查）
+          cp .config ../out/kernel.config
+
+          cd ../out
+          echo "KERNEL_TYPE=${{ inputs.defconfig }}" > build-info.txt
+          echo "KERNEL_VERSION=${{ env.KERNEL_VER }}" >> build-info.txt
+          echo "KSU_ENABLED=${{ inputs.enable_ksu }}" >> build-info.txt
+          echo "COMMIT=${{ github.sha }}" >> build-info.txt
+          echo "TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> build-info.txt
+
+          ls -lh
+          sha256sum kernel > kernel.sha256
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: roost-kernel-${{ inputs.defconfig }}-${{ github.run_number }}
+          path: |
+            out/kernel
+            out/kernel.config
+            out/build-info.txt
+            out/kernel.sha256
+          retention-days: 90
+
+      - name: 创建 Release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kernel-${{ inputs.defconfig }}-${{ github.run_number }}
+          name: Kernel ${{ inputs.defconfig }} #${{ github.run_number }}
+          body: |
+            内核配置: `${{ inputs.defconfig }}`
+            内核版本: `${{ env.KERNEL_VER }}`
+            KernelSU: `${{ inputs.enable_ksu }}`
+            编译时间: `${{ github.run_id }}`
+          files: |
+            out/kernel
+            out/kernel.config
+            out/build-info.txt
+            out/kernel.sha256
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

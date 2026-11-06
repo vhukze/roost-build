@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "version": 1,
+  "updated": "2026-11-06T00:00:00Z",
+  "note": "Roost 云端产物清单。终端用户无需编译，App 读取此文件后直接下载现成二进制。",
+
+  "kernels": [
+    {
+      "id": "goldfish-4.14-ranchu",
+      "name": "goldfish 4.14 ranchu",
+      "description": "AOSP 模拟器专用内核，兼容 API 30-34，支持 Magisk system 模式",
+      "kernel_version": "4.14",
+      "defconfig": "ranchu_defconfig",
+      "api_min": 30,
+      "api_max": 34,
+      "has_ksu": false,
+      "url": "",
+      "sha256": "",
+      "size": "",
+      "status": "not-built",
+      "build_run": ""
+    },
+    {
+      "id": "goldfish-4.14-ranchu-ksu",
+      "name": "goldfish 4.14 ranchu + KernelSU",
+      "description": "集成 KernelSU 的内核，支持内核态 root 与模块系统",
+      "kernel_version": "4.14",
+      "defconfig": "ranchu_defconfig",
+      "api_min": 30,
+      "api_max": 34,
+      "has_ksu": true,
+      "url": "",
+      "sha256": "",
+      "size": "",
+      "status": "not-built",
+      "build_run": ""
+    }
+  ],
+
+  "images": [
+    {
+      "id": "aosp-api34-arm64",
+      "name": "Android 14 (API 34)",
+      "api": 34,
+      "abi": "arm64-v8a",
+      "source": "google",
+      "url": "https://dl.google.com/android/repository/sys-img/google_apis/arm64-v8a-34_r14.zip",
+      "size": "1.50 GB",
+      "note": "Google 官方预编译，含 kernel + system.img + vendor.img"
+    },
+    {
+      "id": "aosp-api33-arm64",
+      "name": "Android 13 (API 33)",
+      "api": 33,
+      "abi": "arm64-v8a",
+      "source": "google",
+      "url": "https://dl.google.com/android/repository/sys-img/google_apis/arm64-v8a-33_r17.zip",
+      "size": "1.64 GB",
+      "note": "Google 官方预编译"
+    },
+    {
+      "id": "aosp-api31-arm64",
+      "name": "Android 12 (API 31)",
+      "api": 31,
+      "abi": "arm64-v8a",
+      "source": "google",
+      "url": "https://dl.google.com/android/repository/sys-img/google_apis/arm64-v8a-31_r11.zip",
+      "size": "1.32 GB",
+      "note": "Google 官方预编译，体积较小"
+    }
+  ],
+
+  "channels": {
+    "primary": "https://raw.githubusercontent.com/vhukze/roost-build/main/artifacts.json",
+    "mirror": "https://ghfast.top/https://raw.githubusercontent.com/vhukze/roost-build/main/artifacts.json"
+  }
+}
