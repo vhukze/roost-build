@@ -230,6 +230,12 @@ mod tests {
         let status = tokio::time::timeout(Duration::from_secs(10), parent.wait()).await.unwrap().unwrap();
         assert!(status.success(), "fixture launcher failed; logs in {dir:?}");
         wait_until(|| dir.join("grandchild.ready").is_file() && dir.join("bypass.ready").is_file()).await;
+        // The process handle can be signalled before the Job's exited-parent
+        // accounting is updated. Wait boundedly for 2 -> 1, not for a fixed delay.
+        wait_until(|| primary.job.active_processes().unwrap() == 1).await;
+        let descendant_before = fs::read_to_string(dir.join("grandchild.heartbeat")).unwrap_or_default();
+        wait_until(|| fs::read_to_string(dir.join("grandchild.heartbeat"))
+            .map(|value| !value.is_empty() && value != descendant_before).unwrap_or(false)).await;
         assert_eq!(primary.job.active_processes().unwrap(), 1, "descendant lost after launcher exit");
         assert_eq!(bypass.job.active_processes().unwrap(), 1);
         primary.job.terminate().unwrap();

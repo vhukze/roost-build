@@ -70,8 +70,9 @@ jobs:
           $resultDir = Join-Path $env:GITHUB_WORKSPACE 'build-evidence'
           New-Item -ItemType Directory -Force $resultDir | Out-Null
           Set-Content -Encoding UTF8 (Join-Path $resultDir 'revision.txt') $env:GITHUB_SHA
-          $files = @(Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe)
-          if ($files.Count -eq 0) { throw 'NSIS installer not produced' }
+          $installers = @(Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe)
+          if ($installers.Count -eq 0) { throw 'NSIS installer not produced' }
+          $files = @($installers) + @(Get-Item src-tauri/target/release/droidbox.exe)
           $files | Get-FileHash -Algorithm SHA256 | Select-Object Path,Hash |
             ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $resultDir 'sha256.json')
       - name: Upload regression logs even when the build fails
@@ -92,4 +93,5 @@ jobs:
           retention-days: 14
           path: |
             app/src-tauri/target/release/bundle/nsis/*.exe
+            app/src-tauri/target/release/droidbox.exe
             build-evidence/*

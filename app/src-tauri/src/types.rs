@@ -543,6 +543,6 @@ mod managed_config_tests {
         let c: VmConfig = serde_json::from_str(r#"{"id":"vm4","name":"old"}"#).unwrap();
         let args = c.build_command(true);
         let i = args.iter().position(|v| v == "-initrd").unwrap();
-        assert_eq!(args[i+1], c.dir().join("boot/ramdisk.img").to_string_lossy());
+        assert_eq!(PathBuf::from(&args[i+1]), c.dir().join("boot").join("ramdisk.img"));
     }
 }
