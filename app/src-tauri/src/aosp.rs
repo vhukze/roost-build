@@ -340,7 +340,7 @@ pub async fn download_image(
         if !src.exists() {
             continue;
         }
-        let _ = tokio::process::Command::new(qemu_img_exe())
+        let _ = crate::background::async_command(qemu_img_exe())
             .args([
                 "convert",
                 "-f",

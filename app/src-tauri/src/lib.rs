@@ -5,6 +5,7 @@
 pub mod adb;
 pub mod aosp;
 pub mod artifacts;
+mod background;
 pub mod catalog;
 pub mod commands;
 pub mod compat;

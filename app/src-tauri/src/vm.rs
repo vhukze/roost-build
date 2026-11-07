@@ -189,7 +189,8 @@ impl VmManager {
         {
             const CREATE_SUSPENDED: u32 = 0x0000_0004;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_SUSPENDED | if !headless { CREATE_NO_WINDOW } else { 0 });
+            // Console visibility is independent of Android's GUI/headless mode.
+            cmd.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
         }
 
         match cmd.spawn() {
@@ -318,7 +319,7 @@ impl VmManager {
 
         std::fs::create_dir_all(config.dir())?;
 
-        let output = Command::new(qemu_img_exe())
+        let output = crate::background::async_command(qemu_img_exe())
             .args([
                 "create",
                 "-f",

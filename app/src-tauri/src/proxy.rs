@@ -46,9 +46,7 @@ fn normalize(raw: &str) -> String {
 
 #[cfg(windows)]
 fn windows_system_proxy() -> Option<String> {
-    use std::process::Command;
-
-    let out = Command::new("reg")
+    let out = crate::background::command("reg")
         .args([
             "query",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",

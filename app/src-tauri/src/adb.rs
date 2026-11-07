@@ -4,7 +4,7 @@
 
 use crate::types::*;
 use std::process::Stdio;
-use tokio::process::Command;
+
 
 /// 命令执行结果
 #[derive(Debug, Clone, serde::Serialize)]
@@ -97,7 +97,7 @@ impl Adb {
             return Err(Error::Command("adb 未安装".into()));
         }
 
-        let mut command = Command::new(exe);
+        let mut command = crate::background::async_command(exe);
         command.args(args).stdin(Stdio::null()).kill_on_drop(true);
         let seconds = if args.iter().any(|v| *v == "install" || *v == "push" || v.contains("--install-module")) { 180 } else { 20 };
         let output = tokio::time::timeout(std::time::Duration::from_secs(seconds), command.output())
