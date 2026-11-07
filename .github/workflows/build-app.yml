@@ -1,0 +1,95 @@
+
+name: Build Roost Windows App
+
+# Compilation and bundling run only on GitHub-hosted runners.
+# Manual dispatch or the explicitly authorized isolated build branch only.
+# This workflow never publishes releases or mutates host drivers.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - build/roost-app-20261107
+
+permissions:
+  contents: read
+
+concurrency:
+  group: roost-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: app
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Check out selected revision
+        uses: actions/checkout@v4
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.11.0
+          run_install: false
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install locked frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check frontend types and build assets
+        run: pnpm build
+      - name: Check locked Rust dependencies and types
+        run: cargo check --manifest-path src-tauri/Cargo.toml --locked
+      - name: Execute Rust unit and Windows process-tree regression tests
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $resultDir = Join-Path $env:GITHUB_WORKSPACE 'build-evidence'
+          New-Item -ItemType Directory -Force $resultDir | Out-Null
+          Set-Content -Encoding UTF8 (Join-Path $resultDir 'revision.txt') $env:GITHUB_SHA
+          $env:TEMP = $env:RUNNER_TEMP
+          $env:TMP = $env:RUNNER_TEMP
+          & cargo test --manifest-path src-tauri/Cargo.toml --locked -- --nocapture 2>&1 |
+            Tee-Object -FilePath (Join-Path $resultDir 'rust-tests.log')
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) { throw "Rust regression tests failed: exit=$testExit" }
+      - name: Build Windows installer
+        run: pnpm tauri build --bundles nsis -- --locked
+      - name: Record source revision and artifact hashes
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $resultDir = Join-Path $env:GITHUB_WORKSPACE 'build-evidence'
+          New-Item -ItemType Directory -Force $resultDir | Out-Null
+          Set-Content -Encoding UTF8 (Join-Path $resultDir 'revision.txt') $env:GITHUB_SHA
+          $files = @(Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe)
+          if ($files.Count -eq 0) { throw 'NSIS installer not produced' }
+          $files | Get-FileHash -Algorithm SHA256 | Select-Object Path,Hash |
+            ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $resultDir 'sha256.json')
+      - name: Upload regression logs even when the build fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roost-checks-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build-evidence/*
+            ${{ runner.temp }}/roost-job-test-*/*
+      - name: Upload installer and build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: roost-windows-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            app/src-tauri/target/release/bundle/nsis/*.exe
+            build-evidence/*
