@@ -244,10 +244,19 @@ impl Adb {
 
     pub async fn emulator_kill(&self) -> Result<CmdResult> {
         if !self.serial.starts_with("emulator-") { return Err(Error::Other("仅Emulator支持此停止方式".into())); }
-        // `emu kill` cuts power to the guest. Flush the guest page cache first, otherwise
-        // writes made just before stopping (module install, Magisk state, app data) can be
-        // lost on the next cold boot. A failed sync must not skip the stop itself.
+        // `emu kill` is a power cut: the QEMU-side image cache is never flushed, so files
+        // written moments before stopping can come back as zero bytes on the next boot
+        // (observed with an installed module). Flush, then power the guest off so QEMU
+        // closes the image itself; only fall back to the hard kill if that does not finish.
         let _ = self.run_serial(&["shell", "sync"]).await;
+        if let Ok(result) = self.run_serial(&["shell", "reboot -p"]).await {
+            if result.ok {
+                for _ in 0..40 {
+                    if !self.connect().await { return Ok(result); }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
         self.run_serial(&["emu", "kill"]).await
     }
 
