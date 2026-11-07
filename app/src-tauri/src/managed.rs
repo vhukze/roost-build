@@ -612,12 +612,41 @@ pub fn emulator_command(c: &VmConfig, headless: bool) -> Result<Vec<String>> {
         "-kernel".into(), kernel.to_string_lossy().into_owned(),
         "-system".into(), image.join("system.img").to_string_lossy().into_owned(),
         "-ramdisk".into(), c.dir().join("boot/ramdisk.img").to_string_lossy().into_owned(),
-        "-port".into(), c.console_port.to_string(), "-accel".into(), "on".into(),
+        "-port".into(), c.console_port.to_string(), "-accel".into(), emulator_accel(&c.accel)?.into(),
         "-memory".into(), c.memory_mb.to_string(), "-cores".into(), c.cores.to_string(),
         "-gpu".into(), "swiftshader_indirect".into(), "-no-snapshot".into()];
     if image.join("vendor.img").is_file() { args.extend(["-vendor".into(), image.join("vendor.img").to_string_lossy().into_owned()]); }
     if headless { args.extend(["-no-window".into(), "-no-audio".into()]); }
     Ok(args)
+}
+
+/// Emulator accepts only on/off. "off" is the explicit opt-out that keeps a host
+/// hypervisor driver (for example AEHD) out of the boot path entirely.
+fn emulator_accel(value: &str) -> Result<&'static str> {
+    match value {
+        "on" | "auto" | "kvm" | "hax" | "hvf" => Ok("on"),
+        "off" | "tcg" => Ok("off"),
+        other => Err(Error::Other(format!("Emulator 加速仅支持 on/auto/kvm/hax/hvf 或 off/tcg: {other}"))),
+    }
+}
+
+#[cfg(test)]
+mod emulator_accel_tests {
+    use super::emulator_accel;
+
+    // Only explicit software selections may drop hardware acceleration.
+    #[test]
+    fn acceleration_requires_an_explicit_selection() {
+        assert_eq!(emulator_accel("on").unwrap(), "on");
+        assert_eq!(emulator_accel("auto").unwrap(), "on");
+        assert_eq!(emulator_accel("kvm").unwrap(), "on");
+        assert_eq!(emulator_accel("hvf").unwrap(), "on");
+        assert_eq!(emulator_accel("off").unwrap(), "off");
+        assert_eq!(emulator_accel("tcg").unwrap(), "off");
+        for rejected in ["", "aehd", "ON", "on,thread=multi", " off", "0"] {
+            assert!(emulator_accel(rejected).is_err(), "unexpected acceptance: {rejected:?}");
+        }
+    }
 }
 
 fn require_ok(result: CmdResult) -> Result<CmdResult> {
