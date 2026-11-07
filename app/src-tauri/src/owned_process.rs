@@ -268,6 +268,9 @@ mod tests {
             .map(|value| !value.is_empty() && value != descendant_before).unwrap_or(false)).await;
         primary.job.terminate().unwrap();
         wait_until(|| primary.job.active_processes().unwrap() == 0).await;
+        // TerminateJobObject completes asynchronously; accounting can reach zero
+        // before the retained process handle becomes signalled.
+        wait_until(|| unsafe { WaitForSingleObject(descendant.raw(), 0) } == 0).await;
         assert_eq!(unsafe { WaitForSingleObject(descendant.raw(), 0) }, 0, "owned descendant survived termination");
         assert_eq!(unsafe { WaitForSingleObject(independent.raw(), 0) }, 258, "another Job's fixture was affected");
         assert!(outside.try_wait().unwrap().is_none(), "unrelated fixture was terminated");
