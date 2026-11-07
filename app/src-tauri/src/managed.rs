@@ -536,6 +536,10 @@ pub fn prepare_emulator_data(c: &VmConfig) -> Result<()> {
     prepare_emulator_data_in_dir(c, &c.dir())
 }
 
+/// Guest ABIs this backend can boot. arm64 runs under emulator TCG translation,
+/// so it needs no host hypervisor and stays usable where AEHD is unstable.
+const SUPPORTED_EMULATOR_ABIS: [&str; 2] = ["x86_64", "arm64-v8a"];
+
 // Production uses c.dir(); tests provide isolated temp directories, never real VMs.
 fn prepare_emulator_data_in_dir(c: &VmConfig, vm_dir: &Path) -> Result<()> {
     c.validate()?;
@@ -547,18 +551,23 @@ fn prepare_emulator_data_in_dir(c: &VmConfig, vm_dir: &Path) -> Result<()> {
     for name in ["system.img", "ramdisk.img", "userdata.img"] {
         if !image.join(name).is_file() { return Err(Error::PathNotFound(image.join(name))); }
     }
-    // Require an explicitly selected x86_64 image for the accelerated backend.
+    // The image and the source AVD must agree on one supported ABI. arm64 guests
+    // are allowed because the emulator runs them under software TCG translation.
     let prop = std::fs::read_to_string(image.join("build.prop")).unwrap_or_default();
-    if config_value(&prop, "ro.product.cpu.abi") != Some("x86_64")
-        && config_value(&prop, "ro.system.product.cpu.abi") != Some("x86_64") {
-        return Err(Error::Other("Emulator 镜像 build.prop 未确认 x86_64 ABI".into()));
+    let image_abi = config_value(&prop, "ro.product.cpu.abi")
+        .or_else(|| config_value(&prop, "ro.system.product.cpu.abi"))
+        .ok_or_else(|| Error::Other("Emulator 镜像 build.prop 未声明 ro.product.cpu.abi".into()))?;
+    if !SUPPORTED_EMULATOR_ABIS.contains(&image_abi) {
+        return Err(Error::Other(format!("Emulator 镜像 ABI 暂不支持: {image_abi}")));
     }
     // Copy only the selected AVD metadata; all mutable paths stay under this VM.
     let source_avd = PathBuf::from(&c.avd_home).join(format!("{}.avd", c.avd_name)).join("config.ini");
     if !source_avd.is_file() { return Err(Error::PathNotFound(source_avd)); }
     let source_config = std::fs::read_to_string(&source_avd)?;
-    if config_value(&source_config, "abi.type") != Some("x86_64") {
-        return Err(Error::Other("源AVD config.ini未确认abi.type=x86_64".into()));
+    let avd_abi = config_value(&source_config, "abi.type")
+        .ok_or_else(|| Error::Other("源AVD config.ini未声明abi.type".into()))?;
+    if avd_abi != image_abi {
+        return Err(Error::Other(format!("源AVD abi.type={avd_abi} 与镜像 ABI={image_abi} 不一致")));
     }
     let avd_dir = vm_dir.join("avd").join(format!("{}.avd", c.avd_name));
     std::fs::create_dir_all(&avd_dir)?;
