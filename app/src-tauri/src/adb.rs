@@ -244,6 +244,10 @@ impl Adb {
 
     pub async fn emulator_kill(&self) -> Result<CmdResult> {
         if !self.serial.starts_with("emulator-") { return Err(Error::Other("仅Emulator支持此停止方式".into())); }
+        // `emu kill` cuts power to the guest. Flush the guest page cache first, otherwise
+        // writes made just before stopping (module install, Magisk state, app data) can be
+        // lost on the next cold boot. A failed sync must not skip the stop itself.
+        let _ = self.run_serial(&["shell", "sync"]).await;
         self.run_serial(&["emu", "kill"]).await
     }
 
