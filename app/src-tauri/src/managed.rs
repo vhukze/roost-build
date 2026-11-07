@@ -384,6 +384,35 @@ pub async fn check_acceleration(c: &VmConfig) -> Result<()> {
     Ok(())
 }
 
+fn config_value<'a>(text: &'a str, wanted: &str) -> Option<&'a str> {
+    // INI/properties permit whitespace around '='. Last assignment wins.
+    text.lines().filter_map(|line| {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') { return None; }
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == wanted).then_some(value.trim())
+    }).last()
+}
+
+#[cfg(test)]
+mod emulator_config_tests {
+    use super::config_value;
+
+    #[test]
+    fn ini_values_accept_sdk_spacing_and_crlf() {
+        assert_eq!(config_value("abi.type = x86_64\r\nhw.cpu.ncore = 4\r\n", "abi.type"), Some("x86_64"));
+        assert_eq!(config_value("abi.type=x86_64\n", "abi.type"), Some("x86_64"));
+        assert_eq!(config_value("ro.product.cpu.abi = x86_64\n", "ro.product.cpu.abi"), Some("x86_64"));
+    }
+
+    #[test]
+    fn ini_values_do_not_trust_comments_or_shadowed_abis() {
+        assert_eq!(config_value("# abi.type=x86_64\n;abi.type=x86_64\n", "abi.type"), None);
+        assert_eq!(config_value("abi.type=x86_64\nabi.type=arm64-v8a\n", "abi.type"), Some("arm64-v8a"));
+        assert_eq!(config_value("not.abi.type=x86_64\n", "abi.type"), None);
+    }
+}
+
 pub fn prepare_emulator_data(c: &VmConfig) -> Result<()> {
     c.validate()?;
     validate_component(&c.avd_name)?;
@@ -396,14 +425,15 @@ pub fn prepare_emulator_data(c: &VmConfig) -> Result<()> {
     }
     // Require an explicitly selected x86_64 image for the accelerated backend.
     let prop = std::fs::read_to_string(image.join("build.prop")).unwrap_or_default();
-    if !prop.lines().any(|l| l.trim() == "ro.product.cpu.abi=x86_64" || l.trim() == "ro.system.product.cpu.abi=x86_64") {
+    if config_value(&prop, "ro.product.cpu.abi") != Some("x86_64")
+        && config_value(&prop, "ro.system.product.cpu.abi") != Some("x86_64") {
         return Err(Error::Other("Emulator 镜像 build.prop 未确认 x86_64 ABI".into()));
     }
     // Copy only the selected AVD metadata; all mutable paths stay under this VM.
     let source_avd = PathBuf::from(&c.avd_home).join(format!("{}.avd", c.avd_name)).join("config.ini");
     if !source_avd.is_file() { return Err(Error::PathNotFound(source_avd)); }
     let source_config = std::fs::read_to_string(&source_avd)?;
-    if !source_config.lines().any(|line| line.trim() == "abi.type=x86_64") {
+    if config_value(&source_config, "abi.type") != Some("x86_64") {
         return Err(Error::Other("源AVD config.ini未确认abi.type=x86_64".into()));
     }
     let avd_dir = c.dir().join("avd").join(format!("{}.avd", c.avd_name));
