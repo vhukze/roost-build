@@ -141,6 +141,25 @@ mod tests {
 
     const WORKER: &str = "owned_process::tests::job_worker";
 
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
+        fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+    }
+
+    fn retained_fixture_process(dir: &Path, role: &str, job: &ProcessJob) -> OwnedHandle {
+        let pid: u32 = fs::read_to_string(dir.join(format!("{role}.ready"))).unwrap().trim().parse().unwrap();
+        // Retain only QUERY_LIMITED_INFORMATION | SYNCHRONIZE for the fixture.
+        // All termination remains scoped to its test-created Job, never this PID.
+        let process = OwnedHandle::new(unsafe { OpenProcess(0x0010_1000, 0, pid) }).unwrap();
+        let mut member = 0i32;
+        assert_ne!(unsafe { IsProcessInJob(process.raw(), job.0.raw(), &mut member) }, 0);
+        assert_eq!(member, 1, "fixture is not a member of the expected Job");
+        assert_eq!(unsafe { WaitForSingleObject(process.raw(), 0) }, 258, "fixture already exited");
+        process
+    }
+
     #[test]
     fn win32_abi_sizes() {
         assert_eq!(size_of::<ThreadEntry>(), 28);
@@ -234,20 +253,27 @@ mod tests {
         let status = tokio::time::timeout(Duration::from_secs(10), parent.wait()).await.unwrap().unwrap();
         assert!(status.success(), "fixture launcher failed; logs in {dir:?}");
         wait_until(|| dir.join("grandchild.ready").is_file() && dir.join("bypass.ready").is_file()).await;
-        // The process handle can be signalled before the Job's exited-parent
-        // accounting is updated. Wait boundedly for 2 -> 1, not for a fixed delay.
-        wait_until(|| primary.job.active_processes().unwrap() == 1).await;
+        // Windows may also assign conhost.exe to a console fixture's Job.
+        // Assert exact fixture membership and liveness rather than an OS-dependent
+        // process count of 1. The production stop condition remains exactly zero.
+        let descendant = retained_fixture_process(&dir, "grandchild", &primary.job);
+        let independent = retained_fixture_process(&dir, "bypass", &bypass.job);
+        let primary_count = primary.job.active_processes().unwrap();
+        let bypass_count = bypass.job.active_processes().unwrap();
+        fs::write(dir.join("job-counts.txt"), format!("primary={primary_count}\nbypass={bypass_count}\n")).unwrap();
+        assert!(primary_count >= 1, "descendant lost after launcher exit");
+        assert!(bypass_count >= 1);
         let descendant_before = fs::read_to_string(dir.join("grandchild.heartbeat")).unwrap_or_default();
         wait_until(|| fs::read_to_string(dir.join("grandchild.heartbeat"))
             .map(|value| !value.is_empty() && value != descendant_before).unwrap_or(false)).await;
-        assert_eq!(primary.job.active_processes().unwrap(), 1, "descendant lost after launcher exit");
-        assert_eq!(bypass.job.active_processes().unwrap(), 1);
         primary.job.terminate().unwrap();
         wait_until(|| primary.job.active_processes().unwrap() == 0).await;
+        assert_eq!(unsafe { WaitForSingleObject(descendant.raw(), 0) }, 0, "owned descendant survived termination");
+        assert_eq!(unsafe { WaitForSingleObject(independent.raw(), 0) }, 258, "another Job's fixture was affected");
         assert!(outside.try_wait().unwrap().is_none(), "unrelated fixture was terminated");
         let before = fs::read_to_string(dir.join("bypass.heartbeat")).unwrap_or_default();
         wait_until(|| fs::read_to_string(dir.join("bypass.heartbeat")).map(|value| !value.is_empty() && value != before).unwrap_or(false)).await;
-        assert_eq!(bypass.job.active_processes().unwrap(), 1, "another Job was affected");
+        assert!(bypass.job.active_processes().unwrap() >= 1, "another Job was affected");
         fs::write(dir.join("stop"), b"stop").unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(10), outside.wait()).await.unwrap().unwrap().success());
         wait_until(|| bypass.job.active_processes().unwrap() == 0).await;
