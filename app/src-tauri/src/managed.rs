@@ -1079,6 +1079,17 @@ async fn install_zip_checked(adb: &Adb, c: &VmConfig, path: &str, selection: Opt
     }
     let state = adb.su_shell(&format!("test -s /data/adb/modules/{module_id}/module.prop")).await?;
     if !state.ok { return Err(Error::Other(format!("安装器退出成功但未发现可用模块 {module_id}；{}", result.output()))); }
+    // Keep an immutable guest-side copy outside Magisk's module tree. On this guest,
+    // Magisk's next-boot module migration truncates most files to zero bytes before
+    // post-fs-data module scripts run. Restore from this copy at the earliest hook.
+    let backup = format!("/data/adb/roost-module-backups/{module_id}");
+    let restore = format!("/data/adb/post-fs-data.d/roost-restore-{module_id}.sh");
+    let restore_cmd = format!(
+        "set -e; mkdir -p /data/adb/roost-module-backups; rm -rf {backup}; mkdir -p {backup}; cp -a /data/adb/modules/{module_id}/. {backup}/; mkdir -p /data/adb/post-fs-data.d; cat > {restore} <<'ROOST_RESTORE_EOF\\n#!/system/bin/sh\\nset -e\\nbackup={backup}\\ntarget=/data/adb/modules/{module_id}\\n[ -d \\\"$backup\\\" ] || exit 0\\nrm -rf \\\"$target\\\"\\nmkdir -p \\\"$target\\\"\\ncp -a \\\"$backup\\\"/. \\\"$target\\\"/\\nROOST_RESTORE_EOF\\nchmod 755 {restore}; test -s {backup}/module.prop; test -s {restore}");
+    let backup_result = adb.su_shell(&restore_cmd).await?;
+    if !backup_result.ok {
+        return Err(Error::Other(format!("模块启动恢复副本创建失败；未标记待重启。{}", backup_result.output())));
+    }
     Ok(ModuleInstallResult { ok: true, stdout: result.stdout, stderr: result.stderr,
         code: result.code, needs_reboot: true, module_id })
 }
