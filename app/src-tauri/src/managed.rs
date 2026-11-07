@@ -1063,8 +1063,22 @@ async fn install_zip_checked(adb: &Adb, c: &VmConfig, path: &str, selection: Opt
     // Cleanup is limited to this operation's generated file on this exact serial.
     let _ = adb.shell(&format!("rm -f {remote}")).await;
     let result = require_ok(result?)?;
-    let state = adb.su_shell(&format!("test -f /data/adb/modules_update/{module_id}/module.prop || test -f /data/adb/modules/{module_id}/module.prop")).await?;
-    if !state.ok { return Err(Error::Other(format!("安装器退出成功但未发现模块 {module_id}；{}", result.output()))); }
+    // Magisk merges modules_update into modules on the next boot, and on this guest that
+    // merge leaves most payload files as 0 bytes (observed: installed files were correct,
+    // then module.prop/scripts/apks became empty and zygisk dlopen failed on a 0-byte
+    // library). Publish the staged tree ourselves and verify every file before the reboot.
+    let staged = format!("/data/adb/modules_update/{module_id}");
+    let staged_probe = adb.su_shell(&format!("test -d {staged}")).await?;
+    if staged_probe.ok {
+        let published = adb.su_shell(&format!(
+            "set -e; target=/data/adb/modules/{module_id}; rm -rf \"$target\"; mkdir -p \"$target\"; cp -a {staged}/. \"$target\"/; find \"$target\" -type f -size 0 | grep -q . && exit 3; rm -f \"$target/update\"; rm -rf {staged}; test -s \"$target/module.prop\""))
+            .await?;
+        if !published.ok {
+            return Err(Error::Other(format!("模块文件搬运后校验失败（存在0字节文件）；未标记待重启。{}", published.output())));
+        }
+    }
+    let state = adb.su_shell(&format!("test -s /data/adb/modules/{module_id}/module.prop")).await?;
+    if !state.ok { return Err(Error::Other(format!("安装器退出成功但未发现可用模块 {module_id}；{}", result.output()))); }
     Ok(ModuleInstallResult { ok: true, stdout: result.stdout, stderr: result.stderr,
         code: result.code, needs_reboot: true, module_id })
 }
