@@ -413,7 +413,131 @@ mod emulator_config_tests {
     }
 }
 
+fn data_partition_size(text: &str) -> Result<String> {
+    let value = config_value(text, "disk.dataPartition.size").unwrap_or("6442450944");
+    let (digits, multiplier) = match value.as_bytes().last().copied() {
+        Some(b'M' | b'm') => (&value[..value.len() - 1], 1024_u64 * 1024),
+        Some(b'G' | b'g') => (&value[..value.len() - 1], 1024_u64 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    let bytes = if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        digits.parse::<u64>().ok().and_then(|n| n.checked_mul(multiplier))
+    } else { None };
+    match bytes {
+        Some(size) if (1024_u64 * 1024 * 1024..=1024_u64 * 1024 * 1024 * 1024).contains(&size) => Ok(size.to_string()),
+        _ => Err(Error::Other("源AVD的disk.dataPartition.size须为1GiB至1TiB的字节数或M/G容量；未修改任何已有数据盘".into())),
+    }
+}
+
+#[cfg(test)]
+mod data_partition_tests {
+    use super::data_partition_size;
+
+    #[test]
+    fn preserve_sdk_capacity_or_use_explicit_default() {
+        assert_eq!(data_partition_size("").unwrap(), "6442450944");
+        for value in ["6442450944", "6G", "6144M"] {
+            assert_eq!(data_partition_size(&format!("disk.dataPartition.size = {value}\r\n")).unwrap(), "6442450944");
+        }
+    }
+
+    #[test]
+    fn reject_small_overflowing_or_injected_capacity() {
+        for value in ["0", "1048576", "999999999999999999999G", "-6G", "6 G"] {
+            assert!(data_partition_size(&format!("disk.dataPartition.size={value}")).is_err(), "{value}");
+        }
+        assert!(data_partition_size("disk.dataPartition.size=6G\ndisk.dataPartition.size=garbage").is_err());
+    }
+
+    // Disposable CI fixtures only; never resolve project_root(), c.dir(), or SDK tools.
+    fn emulator_fixture(label: &str) -> (crate::types::VmConfig, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("roost-data-{label}-{}-{nonce}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir(&base).unwrap();
+        let image = base.join("image");
+        let source_home = base.join("source-avd");
+        std::fs::create_dir(&image).unwrap();
+        std::fs::create_dir_all(source_home.join("fixture.avd")).unwrap();
+        for name in ["system.img", "ramdisk.img", "userdata.img", "encryptionkey.img"] {
+            std::fs::write(image.join(name), format!("read-only fixture {name}")).unwrap();
+        }
+        std::fs::write(image.join("build.prop"), "ro.product.cpu.abi=x86_64\n").unwrap();
+        std::fs::write(source_home.join("fixture.avd/config.ini"), "abi.type=x86_64\ndisk.dataPartition.size=6G\ndisk.dataPartition.path=must-not-inherit\ndisk.encryptionKeyPartition.path=must-not-inherit\n").unwrap();
+        let config = serde_json::from_value(serde_json::json!({
+            "id":"data-fixture", "name":"isolated data fixture", "backend":"android-emulator",
+            "root_manager":"none", "sdk_path":base.join("sdk").to_string_lossy(),
+            "avd_home":source_home.to_string_lossy(), "avd_name":"fixture",
+            "emulator_image_dir":image.to_string_lossy()
+        })).unwrap();
+        (config, base.join("private-vm"))
+    }
+
+    #[test]
+    fn fresh_data_leaves_userdata_and_keys_absent_for_emulator_initialization() {
+        let (config, private) = emulator_fixture("absent");
+        let source = std::path::Path::new(&config.avd_home).join("fixture.avd/config.ini");
+        let source_before = std::fs::read(&source).unwrap();
+        super::prepare_emulator_data_in_dir(&config, &private).unwrap();
+        assert!(!private.join("emulator/userdata-qemu.img").exists());
+        assert!(!private.join("emulator/encryptionkey.img").exists());
+        assert!(private.join("emulator/image-origin.json").is_file());
+        let prepared = std::fs::read_to_string(private.join("avd/fixture.avd/config.ini")).unwrap();
+        assert!(prepared.contains("disk.dataPartition.size=6442450944"));
+        assert!(!prepared.contains("must-not-inherit"));
+        assert_eq!(std::fs::read(source).unwrap(), source_before);
+    }
+
+    #[test]
+    fn existing_uninitialized_seed_is_rejected_without_overwriting_data_or_key() {
+        let (config, private) = emulator_fixture("seed");
+        let data = private.join("emulator");
+        std::fs::create_dir_all(&data).unwrap();
+        let seed = std::fs::read(std::path::Path::new(&config.emulator_image_dir).join("userdata.img")).unwrap();
+        std::fs::write(data.join("userdata-qemu.img"), &seed).unwrap();
+        std::fs::write(data.join("encryptionkey.img"), b"existing private key").unwrap();
+        let error = super::prepare_emulator_data_in_dir(&config, &private).unwrap_err().to_string();
+        assert!(error.contains("userdata"));
+        assert_eq!(std::fs::read(data.join("userdata-qemu.img")).unwrap(), seed);
+        assert_eq!(std::fs::read(data.join("encryptionkey.img")).unwrap(), b"existing private key");
+        assert!(!data.join("image-origin.json").exists());
+    }
+
+    #[test]
+    fn initialized_same_length_data_and_key_are_not_replaced_on_repeat_preparation() {
+        let (config, private) = emulator_fixture("preserve");
+        let data = private.join("emulator");
+        std::fs::create_dir_all(&data).unwrap();
+        let seed_len = std::fs::metadata(std::path::Path::new(&config.emulator_image_dir).join("userdata.img")).unwrap().len() as usize;
+        let initialized = vec![0x5a; seed_len];
+        std::fs::write(data.join("userdata-qemu.img"), &initialized).unwrap();
+        std::fs::write(data.join("encryptionkey.img"), b"keep private key").unwrap();
+        for _ in 0..2 { super::prepare_emulator_data_in_dir(&config, &private).unwrap(); }
+        assert_eq!(std::fs::read(data.join("userdata-qemu.img")).unwrap(), initialized);
+        assert_eq!(std::fs::read(data.join("encryptionkey.img")).unwrap(), b"keep private key");
+    }
+
+    #[test]
+    fn mismatched_image_identity_retains_origin_and_existing_disk() {
+        let (config, private) = emulator_fixture("identity");
+        let data = private.join("emulator");
+        std::fs::create_dir_all(&data).unwrap();
+        let origin = br#"{"image":"another image","build_prop_sha256":"another digest"}"#;
+        std::fs::write(data.join("image-origin.json"), origin).unwrap();
+        std::fs::write(data.join("userdata-qemu.img"), b"existing initialized data").unwrap();
+        assert!(super::prepare_emulator_data_in_dir(&config, &private).is_err());
+        assert_eq!(std::fs::read(data.join("image-origin.json")).unwrap(), origin);
+        assert_eq!(std::fs::read(data.join("userdata-qemu.img")).unwrap(), b"existing initialized data");
+    }
+}
+
 pub fn prepare_emulator_data(c: &VmConfig) -> Result<()> {
+    prepare_emulator_data_in_dir(c, &c.dir())
+}
+
+// Production uses c.dir(); tests provide isolated temp directories, never real VMs.
+fn prepare_emulator_data_in_dir(c: &VmConfig, vm_dir: &Path) -> Result<()> {
     c.validate()?;
     validate_component(&c.avd_name)?;
     for value in [&c.sdk_path, &c.avd_home, &c.emulator_image_dir] {
@@ -436,9 +560,9 @@ pub fn prepare_emulator_data(c: &VmConfig) -> Result<()> {
     if config_value(&source_config, "abi.type") != Some("x86_64") {
         return Err(Error::Other("源AVD config.ini未确认abi.type=x86_64".into()));
     }
-    let avd_dir = c.dir().join("avd").join(format!("{}.avd", c.avd_name));
+    let avd_dir = vm_dir.join("avd").join(format!("{}.avd", c.avd_name));
     std::fs::create_dir_all(&avd_dir)?;
-    let mut config = std::fs::read_to_string(&source_avd)?.lines()
+    let mut config = source_config.lines()
         .filter(|l| {
             let key = l.split('=').next().unwrap_or("").trim();
             !key.starts_with("disk.") && !key.starts_with("snapshot.") && !key.starts_with("sdcard.")
@@ -446,11 +570,12 @@ pub fn prepare_emulator_data(c: &VmConfig) -> Result<()> {
                 && key != "hw.sdCard" && key != "fastboot.forceChosenSnapshotBoot"
         })
         .collect::<Vec<_>>().join("\n");
-    config.push_str(&format!("\nimage.sysdir.1={}\nhw.sdCard=no\nfastboot.forceColdBoot=yes\n", image.to_string_lossy().replace('\\', "/")));
+    let capacity = data_partition_size(&source_config)?;
+    config.push_str(&format!("\nimage.sysdir.1={}\ndisk.dataPartition.size={capacity}\nhw.sdCard=no\nfastboot.forceColdBoot=yes\n", image.to_string_lossy().replace('\\', "/")));
     std::fs::write(avd_dir.join("config.ini"), config)?;
-    std::fs::write(c.dir().join("avd").join(format!("{}.ini", c.avd_name)),
+    std::fs::write(vm_dir.join("avd").join(format!("{}.ini", c.avd_name)),
         format!("avd.ini.encoding=UTF-8\npath={}\n", avd_dir.to_string_lossy()))?;
-    let data = c.dir().join("emulator");
+    let data = vm_dir.join("emulator");
     std::fs::create_dir_all(&data)?;
     let identity_path = data.join("image-origin.json");
     let identity = serde_json::json!({ "image": image.canonicalize()?.to_string_lossy(), "build_prop_sha256": sha256_file(&image.join("build.prop"))? });
@@ -459,13 +584,14 @@ pub fn prepare_emulator_data(c: &VmConfig) -> Result<()> {
         if existing != identity { return Err(Error::Other("该VM数据盘属于另一镜像；请新建VM以避免混用userdata/加密密钥".into())); }
     }
     let userdata = data.join("userdata-qemu.img");
-    if !userdata.exists() {
-        std::fs::copy(image.join("userdata.img"), &userdata)?;
-        // Original userdata is initialized, not the template AVD's encrypted user data.
-        if image.join("encryptionkey.img").is_file() {
-            std::fs::copy(image.join("encryptionkey.img"), data.join("encryptionkey.img"))?;
-        }
+    if userdata.is_file()
+        && std::fs::metadata(&userdata)?.len() == std::fs::metadata(image.join("userdata.img"))?.len()
+        && sha256_file(&userdata)? == sha256_file(&image.join("userdata.img"))? {
+        return Err(Error::Other("该VM数据盘仍是未经Emulator初始化的userdata种子，存在/data挂载失败；文件已保留，请新建VM。应用不会自动删除或覆盖既有数据盘".into()));
     }
+    // An absent -data destination is intentional: Emulator initializes/formats it
+    // from the system image and owns the matching encryption metadata. A direct
+    // copy of the 1 MiB seed falsely looks initialized and fails to mount /data.
     std::fs::write(identity_path, serde_json::to_vec_pretty(&identity)?)?;
     Ok(())
 }
@@ -508,26 +634,379 @@ pub struct ModuleInstallResult {
     pub module_id: String,
 }
 
+const DISABLE_LSPOSED_SCRIPT: &str = include_str!("disable-lsposed.sh");
+
+fn disable_staged(result: &CmdResult) -> bool {
+    result.ok && result.code == 0 && result.stdout.trim() == "ROOST_LSPOSED_DISABLE_STAGED"
+}
+
+fn disabled_module_result(result: CmdResult) -> Result<ModuleInstallResult> {
+    if !disable_staged(&result) {
+        return Err(Error::Other(format!(
+            "LSPosed禁用提交未核实；部分目录可能已设置标记，请重新核验。{}", result.output()
+        )));
+    }
+    Ok(ModuleInstallResult { ok: true, stdout: result.stdout, stderr: result.stderr,
+        code: result.code, needs_reboot: true, module_id: "lsposed-disabled".into() })
+}
+
+/// Caller holds the owned VM operation lease and explicit Shell authorization.
+/// Staging all markers is not proof that the current framework has unloaded.
+pub async fn disable_lsposed(adb: &Adb) -> Result<ModuleInstallResult> {
+    disabled_module_result(adb.su_shell(DISABLE_LSPOSED_SCRIPT).await?)
+}
+
+#[cfg(test)]
+mod disable_staging_tests {
+    use super::*;
+
+    fn observation(ok: bool, code: i32, stdout: &str) -> CmdResult {
+        CmdResult { ok, code, stdout: stdout.into(), stderr: String::new() }
+    }
+
+    #[test]
+    fn disable_staging_requires_exit_zero_and_one_exact_completion_marker() {
+        assert!(disable_staged(&observation(true, 0, "ROOST_LSPOSED_DISABLE_STAGED\n")));
+        for (ok, code, output) in [
+            (false, 0, "ROOST_LSPOSED_DISABLE_STAGED"),
+            (true, 2, "ROOST_LSPOSED_DISABLE_STAGED"), (true, 0, ""),
+            (true, 0, "ROOST_LSPOSED_DISABLE_STAGED\nROOST_LSPOSED_DISABLE_STAGED"),
+            (true, 0, "prefix ROOST_LSPOSED_DISABLE_STAGED"),
+            (true, 0, "ROOST_LSPOSED_DISABLE_STAGED\nError: failed"),
+        ] { assert!(!disable_staged(&observation(ok, code, output))); }
+    }
+
+    #[test]
+    fn staging_result_never_claims_live_unload_or_ignores_partial_failure() {
+        let result = disabled_module_result(observation(true, 0, "ROOST_LSPOSED_DISABLE_STAGED\n")).unwrap();
+        assert!(result.ok && result.needs_reboot);
+        assert_eq!(result.module_id, "lsposed-disabled");
+        assert!(disabled_module_result(observation(false, 2, "")).is_err());
+        assert!(disabled_module_result(observation(true, 0, "")).is_err());
+    }
+}
+
+#[derive(Debug)]
+struct ModuleMetadata {
+    id: String,
+    version: Option<String>,
+    version_code: Option<String>,
+}
+
+fn unique_module_property<'a>(prop: &'a str, key: &str) -> Result<Option<&'a str>> {
+    let mut values = prop.lines().filter_map(|line| {
+        let (name, value) = line.split_once('=')?;
+        (name.trim() == key).then_some((name, value))
+    });
+    let entry = values.next();
+    if values.next().is_some() {
+        return Err(Error::Other(format!("module.prop 重复字段: {key}")));
+    }
+    match entry {
+        Some((name, value)) if name == key => Ok(Some(value)),
+        Some(_) => Err(Error::Other(format!("module.prop 字段格式含糊: {key}"))),
+        None => Ok(None),
+    }
+}
+
+fn parse_module_metadata(prop: &str) -> Result<ModuleMetadata> {
+    if prop.len() > 65536 || prop.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
+        return Err(Error::Other("module.prop 过大或含无效控制字符".into()));
+    }
+    let id = unique_module_property(prop, "id")?.unwrap_or("");
+    validate_component(id)?;
+    if !id.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+        return Err(Error::Other("Magisk module id须以字母开头".into()));
+    }
+    let version = unique_module_property(prop, "version")?.map(str::to_string);
+    let version_code = unique_module_property(prop, "versionCode")?;
+    if version_code.map(|v| v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit())).unwrap_or(false) {
+        return Err(Error::Other("module.prop versionCode 须为十进制整数".into()));
+    }
+    Ok(ModuleMetadata { id: id.into(), version, version_code: version_code.map(str::to_string) })
+}
+
+// zip 2.x indexes names in a map. Count bounded raw central entries first so
+// repeated module.prop entries cannot disappear behind that name lookup.
+fn require_unique_module_entry<R: std::io::Read + std::io::Seek>(reader: &mut R, start: u64, indexed_count: usize) -> Result<()> {
+    use std::io::SeekFrom;
+    reader.seek(SeekFrom::Start(start))?;
+    let mut entries = 0usize;
+    let mut properties = 0usize;
+    let mut directory_bytes = 0usize;
+    loop {
+        let mut header = [0u8; 46];
+        reader.read_exact(&mut header[..4])?;
+        if &header[..4] == b"PK\x05\x06" || &header[..4] == b"PK\x06\x06" { break; }
+        if &header[..4] != b"PK\x01\x02" { return Err(Error::Other("模块ZIP中央目录结构不受支持".into())); }
+        reader.read_exact(&mut header[4..])?;
+        let name_len = u16::from_le_bytes([header[28], header[29]]) as usize;
+        let extra_len = u16::from_le_bytes([header[30], header[31]]) as usize;
+        let comment_len = u16::from_le_bytes([header[32], header[33]]) as usize;
+        entries += 1;
+        directory_bytes += 46 + name_len + extra_len + comment_len;
+        if entries > 4096 || directory_bytes > 16 * 1024 * 1024 {
+            return Err(Error::Other("模块ZIP中央目录超过校验预算".into()));
+        }
+        let mut name = vec![0u8; name_len];
+        reader.read_exact(&mut name)?;
+        if name == b"module.prop" { properties += 1; }
+        let mut extra = vec![0u8; extra_len];
+        reader.read_exact(&mut extra)?;
+        let mut cursor = 0usize;
+        while cursor < extra.len() {
+            if extra.len() - cursor < 4 { return Err(Error::Other("模块ZIP扩展字段截断".into())); }
+            let tag = u16::from_le_bytes([extra[cursor], extra[cursor + 1]]);
+            let size = u16::from_le_bytes([extra[cursor + 2], extra[cursor + 3]]) as usize;
+            cursor += 4;
+            if size > extra.len() - cursor { return Err(Error::Other("模块ZIP扩展字段长度无效".into())); }
+            if tag == 0x7075 { return Err(Error::Other("模块ZIP含Unicode路径别名，元数据身份含糊".into())); }
+            cursor += size;
+        }
+        reader.seek(SeekFrom::Current(comment_len as i64))?;
+    }
+    if properties != 1 || entries != indexed_count {
+        return Err(Error::Other("模块ZIP条目重复或根目录module.prop不唯一".into()));
+    }
+    Ok(())
+}
+
+fn read_module_metadata<R: std::io::Read + std::io::Seek>(mut reader: R) -> Result<ModuleMetadata> {
+    use std::io::Read;
+    let archive = zip::ZipArchive::new(&mut reader).map_err(|e| Error::Other(format!("模块 ZIP 无效: {e}")))?;
+    let start = archive.central_directory_start();
+    let indexed_count = archive.len();
+    drop(archive);
+    require_unique_module_entry(&mut reader, start, indexed_count)?;
+    let mut archive = zip::ZipArchive::new(reader).map_err(|e| Error::Other(format!("模块 ZIP 无效: {e}")))?;
+    let member = archive.by_name("module.prop").map_err(|e| Error::Other(format!("module.prop 读取失败: {e}")))?;
+    let kind = member.unix_mode().map(|mode| mode & 0o170000).unwrap_or(0);
+    if !member.is_file() || (kind != 0 && kind != 0o100000) || member.size() > 65536 {
+        return Err(Error::Other("module.prop 须为不大于64KiB的普通文件".into()));
+    }
+    let mut prop = String::new();
+    member.take(65537).read_to_string(&mut prop)?;
+    parse_module_metadata(&prop)
+}
+
+fn normalized_module_version<'a>(actual: &'a str, code: Option<&str>) -> Option<&'a str> {
+    if code.map(|v| v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit())).unwrap_or(false) { return None; }
+    let actual = actual.strip_prefix('v').unwrap_or(actual);
+    if let Some((base, suffix)) = actual.split_once(" (") {
+        let build = suffix.strip_suffix(')')?;
+        if base.is_empty() || base.bytes().any(|b| b.is_ascii_whitespace())
+            || build.is_empty() || !build.bytes().all(|b| b.is_ascii_digit()) || code != Some(build) { return None; }
+        Some(base)
+    } else {
+        if actual.is_empty() || actual.bytes().any(|b| b.is_ascii_whitespace()) { return None; }
+        Some(actual)
+    }
+}
+
+fn require_selected_lsposed(metadata: &ModuleMetadata, selection: &str) -> Result<()> {
+    let (id, version) = match selection {
+        "1.9.2-zygisk" => ("zygisk_lsposed", "1.9.2"),
+        "1.9.2-riru" => ("riru_lsposed", "1.9.2"),
+        _ => return Err(Error::Other("自动应用基线仅支持公开 LSPosed 1.9.2".into())),
+    };
+    let actual = metadata.version.as_deref().and_then(|value| normalized_module_version(value, metadata.version_code.as_deref()));
+    if metadata.id != id || actual != Some(version) {
+        return Err(Error::Other(format!("LSPosed缓存包与所选 {selection} 不匹配；尚未上传或安装")));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod module_package_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    const RELEASE: &str = "id=zygisk_lsposed\nname=Zygisk - LSPosed\nversion=v1.9.2 (7024)\nversionCode=7024\n";
+
+    #[test]
+    fn selected_release_requires_matching_id_and_exact_version() {
+        let metadata = parse_module_metadata(RELEASE).unwrap();
+        assert!(require_selected_lsposed(&metadata, "1.9.2-zygisk").is_ok());
+        for selection in ["1.9.2-riru", "1.9.20-zygisk", "none", ""] {
+            assert!(require_selected_lsposed(&metadata, selection).is_err());
+        }
+        for prop in [RELEASE.replace("zygisk_lsposed", "other_module"),
+            RELEASE.replace("1.9.2", "1.9.20"), RELEASE.replace("version=v1.9.2 (7024)\n", ""),
+            RELEASE.replace("versionCode=7024", "versionCode=7025")] {
+            let metadata = parse_module_metadata(&prop).unwrap();
+            assert!(require_selected_lsposed(&metadata, "1.9.2-zygisk").is_err());
+        }
+        let riru = parse_module_metadata(&RELEASE.replace("zygisk_lsposed", "riru_lsposed")).unwrap();
+        assert!(require_selected_lsposed(&riru, "1.9.2-riru").is_ok());
+    }
+
+    #[test]
+    fn duplicate_and_invalid_metadata_is_not_silently_first_wins() {
+        for extra in ["id=zygisk_lsposed\n", " id =riru_lsposed\n", "version=v1.9.2\n",
+            "versionCode=7024\n", "versionCode=7025\n"] {
+            assert!(parse_module_metadata(&format!("{RELEASE}{extra}")).is_err());
+        }
+        for prop in ["id=\n", "id=../outside\n", "id=123bad\n", "id=good\0name\n", "id=good\nversionCode=x\n",
+            " id=good\n", "id =good\n", "id=good\n version=1.9.2\n", "id=good\nversionCode =7024\n"] {
+            assert!(parse_module_metadata(prop).is_err());
+        }
+        assert!(parse_module_metadata(&"x".repeat(65537)).is_err());
+        // Generic module installs do not require LSPosed-specific fields.
+        assert_eq!(parse_module_metadata("id=custom_module\n").unwrap().id, "custom_module");
+    }
+
+    #[test]
+    fn version_build_suffix_is_shared_with_runtime_observation() {
+        assert_eq!(normalized_module_version("v1.9.2 (7024)", Some("7024")), Some("1.9.2"));
+        assert_eq!(normalized_module_version("1.9.2", None), Some("1.9.2"));
+        for (value, code) in [("1.9.2 (7024)", None), ("1.9.2 (7024)", Some("07024")),
+            ("1.9.2  (7024)", Some("7024")), ("1.9.2 (7024) extra", Some("7024")),
+            ("1.9.2\t", None), ("", None)] {
+            assert_eq!(normalized_module_version(value, code), None);
+        }
+    }
+
+    #[test]
+    fn zip_reader_checks_actual_member_content_and_metadata_limit() {
+        use std::io::Write;
+        for (name, content, expected_ok) in [
+            ("module.prop", RELEASE.as_bytes().to_vec(), true),
+            ("nested/module.prop", RELEASE.as_bytes().to_vec(), false),
+            ("module.prop", b"id=wrong\nid=zygisk_lsposed\n".to_vec(), false),
+            ("module.prop", vec![b'x'; 65537], false),
+            ("module.prop", vec![0xff], false),
+        ] {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            writer.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            writer.write_all(&content).unwrap();
+            let data = writer.finish().unwrap().into_inner();
+            let result = read_module_metadata(Cursor::new(data));
+            assert_eq!(result.is_ok(), expected_ok, "{name}");
+            if expected_ok { assert!(require_selected_lsposed(&result.unwrap(), "1.9.2-zygisk").is_ok()); }
+        }
+    }
+
+    #[test]
+    fn uploaded_digest_requires_success_and_exact_generated_path() {
+        let digest = "a".repeat(64);
+        let remote = "/data/local/tmp/roost-fixture-1.zip";
+        let good = format!("{digest}  {remote}\n");
+        let observation = |ok, code, stdout: String| CmdResult { ok, code, stdout, stderr: String::new() };
+        assert!(uploaded_module_matches(&observation(true, 0, good.clone()), &digest, remote));
+        for result in [observation(false, 0, good.clone()), observation(true, 1, good.clone()),
+            observation(true, 0, format!("{good}extra\n")), observation(true, 0, format!("{good}{good}")),
+            observation(true, 0, format!("{digest}  /data/local/tmp/other.zip\n")),
+            observation(true, 0, format!("{}  {remote}\n", "b".repeat(64)))] {
+            assert!(!uploaded_module_matches(&result, &digest, remote));
+        }
+    }
+
+    #[test]
+    fn archive_hash_rewinds_the_same_reader() {
+        let mut reader = Cursor::new(b"abc".to_vec());
+        let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(module_archive_digest(&mut reader).unwrap(), expected);
+        assert_eq!(reader.position(), 0);
+        assert_eq!(module_archive_digest(&mut reader).unwrap(), expected);
+    }
+
+    fn central_entries(names: &[&[u8]]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for name in names {
+            let mut header = [0u8; 46];
+            header[..4].copy_from_slice(b"PK\x01\x02");
+            header[28..30].copy_from_slice(&(name.len() as u16).to_le_bytes());
+            data.extend_from_slice(&header);
+            data.extend_from_slice(name);
+        }
+        data.extend_from_slice(b"PK\x05\x06");
+        data
+    }
+
+    #[test]
+    fn raw_directory_count_rejects_duplicates_hidden_by_zip_name_map() {
+        let valid = central_entries(&[b"module.prop", b"customize.sh"]);
+        assert!(require_unique_module_entry(&mut Cursor::new(valid), 0, 2).is_ok());
+        let duplicate = central_entries(&[b"module.prop", b"module.prop"]);
+        assert!(require_unique_module_entry(&mut Cursor::new(duplicate), 0, 1).is_err());
+        let other_duplicate = central_entries(&[b"module.prop", b"customize.sh", b"customize.sh"]);
+        assert!(require_unique_module_entry(&mut Cursor::new(other_duplicate), 0, 2).is_err());
+        for names in [vec![b"nested/module.prop".as_slice()], vec![b"MODULE.PROP".as_slice()], vec![]] {
+            let count = names.len();
+            assert!(require_unique_module_entry(&mut Cursor::new(central_entries(&names)), 0, count).is_err());
+        }
+    }
+
+    #[test]
+    fn raw_directory_rejects_unicode_path_aliases_and_malformed_extra_fields() {
+        for extra in [vec![0x75, 0x70, 0, 0], vec![1, 0, 8, 0, 1], vec![1, 0, 0]] {
+            let mut data = central_entries(&[b"module.prop"]);
+            data[30..32].copy_from_slice(&(extra.len() as u16).to_le_bytes());
+            data.splice(46 + b"module.prop".len()..46 + b"module.prop".len(), extra);
+            assert!(require_unique_module_entry(&mut Cursor::new(data), 0, 1).is_err());
+        }
+        let mut data = central_entries(&[b"module.prop"]);
+        data[30..32].copy_from_slice(&4u16.to_le_bytes());
+        data.splice(46 + b"module.prop".len()..46 + b"module.prop".len(), [0x55, 0x54, 0, 0]);
+        assert!(require_unique_module_entry(&mut Cursor::new(data), 0, 1).is_ok());
+    }
+
+    #[test]
+    fn raw_directory_rejects_truncation_bad_signature_and_entry_budget() {
+        for data in [vec![], b"BAD!".to_vec(), b"PK\x01\x02".to_vec()] {
+            assert!(require_unique_module_entry(&mut Cursor::new(data), 0, 1).is_err());
+        }
+        let names = vec![b"module.prop".as_slice(); 4097];
+        assert!(require_unique_module_entry(&mut Cursor::new(central_entries(&names)), 0, names.len()).is_err());
+    }
+}
+
 pub async fn install_zip(adb: &Adb, c: &VmConfig, path: &str) -> Result<ModuleInstallResult> {
+    install_zip_checked(adb, c, path, None).await
+}
+
+/// Validate the actual archive metadata before any device request. Cache filenames
+/// and directory names never establish the package's identity or version.
+pub async fn install_lsposed_zip(adb: &Adb, c: &VmConfig, path: &str, selection: &str) -> Result<ModuleInstallResult> {
+    install_zip_checked(adb, c, path, Some(selection)).await
+}
+
+fn module_archive_digest<R: std::io::Read + std::io::Seek>(reader: &mut R) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::SeekFrom;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 { break; }
+        hash.update(&buffer[..count]);
+    }
+    reader.seek(SeekFrom::Start(0))?;
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn uploaded_module_matches(result: &CmdResult, digest: &str, remote: &str) -> bool {
+    if !result.ok || result.code != 0 || digest.len() != 64
+        || !digest.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) { return false; }
+    result.stdout.trim_end_matches(['\r', '\n']) == format!("{digest}  {remote}")
+}
+
+async fn install_zip_checked(adb: &Adb, c: &VmConfig, path: &str, selection: Option<&str>) -> Result<ModuleInstallResult> {
     let local = Path::new(path);
     if local.extension().and_then(|s| s.to_str()).map(|s| !s.eq_ignore_ascii_case("zip")).unwrap_or(true) {
         return Err(Error::Other("Magisk 安装器仅接收 .zip 模块包".into()));
     }
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(local)?)
-        .map_err(|e| Error::Other(format!("模块 ZIP 无效: {e}")))?;
-    let mut prop = String::new();
-    {
-        use std::io::Read;
-        let member = archive.by_name("module.prop").map_err(|_| Error::Other("ZIP 根目录缺少 module.prop".into()))?;
-        if member.size() > 65536 { return Err(Error::Other("module.prop 过大".into())); }
-        member.take(65537).read_to_string(&mut prop)?;
+    let mut file = std::fs::File::open(local)?;
+    if !file.metadata()?.is_file() { return Err(Error::Other("模块ZIP须为普通文件".into())); }
+    let digest = module_archive_digest(&mut file)?;
+    let metadata = read_module_metadata(&mut file)?;
+    if let Some(selection) = selection { require_selected_lsposed(&metadata, selection)?; }
+    if module_archive_digest(&mut file)? != digest {
+        return Err(Error::Other("模块ZIP在校验期间发生变化；尚未上传或安装".into()));
     }
-    let module_id = prop.lines().find_map(|l| l.trim().strip_prefix("id=")).unwrap_or("").trim().to_string();
-    validate_component(&module_id)?;
-    if !module_id.chars().next().map(|v| v.is_ascii_alphabetic()).unwrap_or(false) {
-        return Err(Error::Other("Magisk module id须以字母开头".into()));
-    }
-    drop(archive);
+    let module_id = metadata.id;
+    drop(file);
     if !adb.is_booted().await { return Err(Error::Other("VM 尚未完成启动".into())); }
     if !adb.check_root().await { return Err(Error::Other("VM 尚未验证 root；请先启动准备好的 Magisk ramdisk".into())); }
     require_ok(adb.su_shell(&format!("{} -v", c.magisk_path)).await?)?;
@@ -535,8 +1014,14 @@ pub async fn install_zip(adb: &Adb, c: &VmConfig, path: &str) -> Result<ModuleIn
     if !environment.ok { return Err(Error::Other("该VM缺少Magisk运行资源；请先点击初始化Magisk运行环境（需已缓存对应完整APK）".into())); }
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let remote = format!("/data/local/tmp/roost-{}-{stamp}.zip", c.id);
-    require_ok(adb.push(path, &remote).await?)?;
-    let result = adb.su_shell(&format!("{} --install-module {remote}", c.magisk_path)).await;
+    let result: Result<CmdResult> = async {
+        require_ok(adb.push(path, &remote).await?)?;
+        let uploaded = adb.shell(&format!("sha256sum {remote}")).await?;
+        if !uploaded_module_matches(&uploaded, &digest, &remote) {
+            return Err(Error::Other("上传模块SHA256未核实；未运行模块安装器".into()));
+        }
+        adb.su_shell(&format!("{} --install-module {remote}", c.magisk_path)).await
+    }.await;
     // Cleanup is limited to this operation's generated file on this exact serial.
     let _ = adb.shell(&format!("rm -f {remote}")).await;
     let result = require_ok(result?)?;
@@ -554,6 +1039,7 @@ pub struct VerifyVmResult {
     pub lsp_state: String,
     pub pending_restart: bool,
     pub message: String,
+    pub boot_id: String,
 }
 
 fn process_probe(name: &str) -> String {
@@ -563,7 +1049,7 @@ fn process_probe(name: &str) -> String {
 }
 
 fn observed_process(result: &CmdResult) -> Option<bool> {
-    if !result.ok { return None; }
+    if !result.ok || result.code != 0 { return None; }
     match result.stdout.trim() {
         "ROOST_PROCESS_PRESENT" => Some(true),
         "ROOST_PROCESS_ABSENT" => Some(false),
@@ -598,47 +1084,232 @@ mod process_observation_tests {
     }
 }
 
+/// Fixed, privileged directory observations. A missing base is known only when its
+/// readable/searchable parent was listed successfully. Any failure emits no marker.
+fn modules_probe(staged: bool) -> String {
+    let base = if staged { "/data/adb/modules_update" } else { "/data/adb/modules" };
+    format!(r#"base={base}; [ -r /data/adb ] && [ -x /data/adb ] && ls -A /data/adb >/dev/null || exit 2; [ ! -L "$base" ] || exit 2; if [ ! -e "$base" ]; then printf 'ROOST_MODULES_DISABLED\n'; exit 0; fi; [ -d "$base" ] && [ -r "$base" ] && [ -x "$base" ] && ls -A "$base" >/dev/null || exit 2; enabled=0; for name in zygisk_lsposed riru_lsposed; do d="$base/$name"; [ ! -L "$d" ] || exit 2; if [ -e "$d" ]; then [ -d "$d" ] && [ -r "$d" ] && [ -x "$d" ] && ls -A "$d" >/dev/null || exit 2; if [ ! -e "$d/disable" ] && [ ! -L "$d/disable" ] && [ ! -e "$d/remove" ] && [ ! -L "$d/remove" ]; then enabled=1; fi; fi; done; if [ "$enabled" -eq 1 ]; then printf 'ROOST_MODULES_ENABLED\n'; else printf 'ROOST_MODULES_DISABLED\n'; fi"#)
+}
+
+fn observed_modules(result: &CmdResult) -> Option<bool> {
+    if !result.ok || result.code != 0 { return None; }
+    match result.stdout.trim() {
+        "ROOST_MODULES_ENABLED" => Some(true),
+        "ROOST_MODULES_DISABLED" => Some(false),
+        _ => None,
+    }
+}
+
+fn selected_module_probe(module_id: &str) -> String {
+    debug_assert!(matches!(module_id, "zygisk_lsposed" | "riru_lsposed"));
+    format!(r#"base=/data/adb/modules; [ -r /data/adb ] && [ -x /data/adb ] && ls -A /data/adb >/dev/null || exit 2; [ ! -L "$base" ] || exit 2; if [ ! -e "$base" ]; then printf 'ROOST_SELECTED_ABSENT\n'; exit 0; fi; [ -d "$base" ] && [ -r "$base" ] && [ -x "$base" ] && ls -A "$base" >/dev/null || exit 2; d="$base/{module_id}"; [ ! -L "$d" ] || exit 2; if [ ! -e "$d" ]; then printf 'ROOST_SELECTED_ABSENT\n'; exit 0; fi; [ -d "$d" ] && [ -r "$d" ] && [ -x "$d" ] && ls -A "$d" >/dev/null || exit 2; if [ -e "$d/disable" ] || [ -L "$d/disable" ] || [ -e "$d/remove" ] || [ -L "$d/remove" ]; then printf 'ROOST_SELECTED_ABSENT\n'; exit 0; fi; [ -f "$d/module.prop" ] && [ -r "$d/module.prop" ] || exit 2; printf 'ROOST_SELECTED_BEGIN\n'; cat "$d/module.prop" || exit 2; printf '\nROOST_SELECTED_END\n'"#)
+}
+
+/// None means unreadable/malformed; false means an observed absent/other selection.
+fn observed_selected_module(result: &CmdResult, module_id: &str, version: &str) -> Option<bool> {
+    if !result.ok || result.code != 0 { return None; }
+    let output = result.stdout.trim();
+    if output == "ROOST_SELECTED_ABSENT" { return Some(false); }
+    let body = output.strip_prefix("ROOST_SELECTED_BEGIN\n")?.strip_suffix("\nROOST_SELECTED_END")?;
+    if body.lines().any(|line| line.starts_with("ROOST_SELECTED_")) { return None; }
+    let metadata = parse_module_metadata(body).ok()?;
+    let actual = metadata.version.as_deref()?;
+    let base = normalized_module_version(actual, metadata.version_code.as_deref())?;
+    let expected = version.strip_prefix('v').unwrap_or(version);
+    Some(metadata.id == module_id && base == expected)
+}
+
+fn observed_magisk_version(result: &CmdResult, expected: &str) -> bool {
+    if !result.ok || result.code != 0 || result.stdout.trim().lines().count() != 1 { return false; }
+    let actual = result.stdout.trim().split(':').next().unwrap_or("");
+    let expected = expected.strip_prefix('v').unwrap_or(expected);
+    !expected.is_empty() && actual == expected
+}
+
+/// Only all three successful negative observations establish known-disabled state.
+fn lsposed_observation_state(wanted_none: bool, root: bool, active: Option<bool>, staged: Option<bool>,
+    lspd: Option<bool>, selected: Option<bool>) -> (bool, bool, &'static str) {
+    if wanted_none {
+        if root && active == Some(false) && staged == Some(false) && lspd == Some(false) {
+            return (true, false, "disabled");
+        }
+        if active == Some(true) || staged == Some(true) || lspd == Some(true) {
+            return (false, false, "disable-pending-restart");
+        }
+        return (false, false, "unknown");
+    }
+    if !root || active.is_none() || staged.is_none() || lspd.is_none() {
+        return (false, false, "unknown");
+    }
+    match selected {
+        Some(false) => (false, false, "not-installed"),
+        Some(true) => (false, true, match lspd {
+            Some(false) => "installed-not-running",
+            Some(true) => "running-unverified",
+            None => "unknown",
+        }),
+        None => (false, false, "unknown"),
+    }
+}
+
 pub async fn verify_vm(adb: &Adb, c: &VmConfig) -> Result<VerifyVmResult> {
-    if !adb.is_booted().await { return Err(Error::Other("VM 尚未完成启动".into())); }
-    let root = adb.check_root().await;
-    let daemon = adb.shell(&process_probe("magiskd")).await?;
-    let magisk_present = observed_process(&daemon)
-        .ok_or_else(|| Error::Other(format!("Magisk进程观测失败，未判定为无Root: {}", daemon.output())))?;
-    let root_verified = if c.root_manager == "none" { !magisk_present } else {
-        let actual = adb.su_shell(&format!("{} -v", c.magisk_path)).await?;
-        let expected = c.root_manager.strip_prefix("magisk@").unwrap_or("");
-        actual.ok && root && actual.stdout.trim().split(':').next().unwrap_or("") == expected.trim_start_matches('v')
+    c.validate()?;
+    let expected_magisk = match c.root_manager.as_str() {
+        "none" => None,
+        selection => Some(selection.strip_prefix("magisk@")
+            .ok_or_else(|| Error::Other("验证仅支持none或Magisk选择".into()))?),
     };
-    let check = adb.su_shell(r#"for d in /data/adb/modules/zygisk_lsposed /data/adb/modules/riru_lsposed; do if [ -d "$d" ] && [ ! -e "$d/disable" ] && [ ! -e "$d/remove" ]; then cat "$d/module.prop"; fi; done; pidof lspd; true"#).await?;
+    let boot_id = crate::guest::current_boot(adb).await?;
+    let daemon = adb.shell(&process_probe("magiskd")).await.ok();
+    let magisk_present = daemon.as_ref().and_then(observed_process);
+    // A stock/none observation must never issue su just to inspect private dirs.
+    let root = if expected_magisk.is_some() { adb.check_root().await } else { false };
+    let root_verified = if let Some(expected) = expected_magisk {
+        if root {
+            let actual = adb.su_shell(&format!("{} -v", c.magisk_path)).await.ok();
+            magisk_present == Some(true) && actual.as_ref().map(|result| observed_magisk_version(result, expected)).unwrap_or(false)
+        } else { false }
+    } else { magisk_present == Some(false) };
+    let process = adb.shell(&process_probe("lspd")).await.ok();
+    let lspd = process.as_ref().and_then(observed_process);
     let wanted = c.lsp_desired();
-    let staged = adb.su_shell(r#"for d in /data/adb/modules_update/zygisk_lsposed /data/adb/modules_update/riru_lsposed; do if [ -d "$d" ] && [ ! -e "$d/disable" ] && [ ! -e "$d/remove" ]; then echo STAGED_ENABLED; fi; done"#).await?;
-    let staged_enabled = staged.ok && staged.stdout.contains("STAGED_ENABLED");
-    let process = adb.shell(&process_probe("lspd")).await?;
-    let lspd = observed_process(&process)
-        .ok_or_else(|| Error::Other(format!("LSPosed进程观测失败，未判定为已禁用: {}", process.output())))?;
-    let version = wanted.rsplit_once('-').map(|(v,_)| v).unwrap_or(wanted);
+    let (active, staged) = if root {
+        let active = adb.su_shell(&modules_probe(false)).await.ok();
+        let staged = adb.su_shell(&modules_probe(true)).await.ok();
+        (active.as_ref().and_then(observed_modules), staged.as_ref().and_then(observed_modules))
+    } else { (None, None) };
+    let version = wanted.rsplit_once('-').map(|(v, _)| v).unwrap_or(wanted);
     let expected_id = if wanted.ends_with("-zygisk") { Some("zygisk_lsposed") }
         else if wanted.ends_with("-riru") { Some("riru_lsposed") } else { None };
-    let lsp_installed = if let Some(module_id) = expected_id {
-        let selected = adb.su_shell(&format!("d=/data/adb/modules/{module_id}; test -d \"$d\" && test ! -e \"$d/disable\" && test ! -e \"$d/remove\" && cat \"$d/module.prop\"")).await?;
-        let has_id = selected.stdout.lines().any(|line| line.trim() == format!("id={module_id}"));
-        selected.ok && has_id && selected.stdout.lines().filter_map(|line| line.trim().strip_prefix("version="))
-            .any(|value| value.split_whitespace().next().unwrap_or("").trim_start_matches('v') == version)
-    } else { false };
-    let (lsp_verified, lsp_state) = if wanted == "none" {
-        (!lspd && !staged_enabled && (!root || (check.ok && !check.stdout.contains("id="))),
-            if lspd || staged_enabled { "disable-pending-restart".to_string() } else { "disabled".to_string() })
-    } else if !lsp_installed { (false, "not-installed".into()) }
-    else if !lspd { (false, "installed-not-running".into()) }
-    else {
-        let preinit = adb.su_shell("test -s /metadata/magisk/sepolicy.rule || test -s /persist/magisk/sepolicy.rule").await?;
-        // A process, ZIP exit status, or rule file alone never proves framework activation.
-        (false, if preinit.ok { "running-unverified: 请在LSPosed管理器确认完整激活".into() }
-            else { "partial: 缺少已检查的preinit sepolicy.rule；核查准备ramdisk的PREINITDEVICE".into() })
-    };
-    Ok(VerifyVmResult { root_verified, lsp_verified, lsp_installed, lsp_state,
-        pending_restart: false,
-        message: "LSPosed进程/文件仅作部分状态证据，完整激活须管理器复核；准备ramdisk须保留官方backup和PREINITDEVICE".into() })
+    let selected = if root {
+        if let Some(module_id) = expected_id {
+            let result = adb.su_shell(&selected_module_probe(module_id)).await.ok();
+            result.as_ref().and_then(|result| observed_selected_module(result, module_id, version))
+        } else { None }
+    } else { None };
+    let (lsp_verified, lsp_installed, lsp_state) = lsposed_observation_state(wanted == "none", root, active, staged, lspd, selected);
+    crate::guest::require_same_boot(&boot_id, &crate::guest::current_boot(adb).await?)?;
+    Ok(VerifyVmResult { root_verified, lsp_verified, lsp_installed, lsp_state: lsp_state.into(),
+        pending_restart: false, boot_id,
+        message: "unknown表示探测未完成、失败或证据不足，不代表已禁用；进程和模块文件仅作部分证据，LSPosed完整激活须管理器复核；准备ramdisk须保留官方backup和PREINITDEVICE".into() })
+}
+
+#[cfg(test)]
+mod reliable_verification_tests {
+    use super::*;
+
+    fn observation(ok: bool, code: i32, stdout: &str) -> CmdResult {
+        CmdResult { ok, code, stdout: stdout.into(), stderr: String::new() }
+    }
+
+    #[test]
+    fn tagged_modules_require_success_exit_zero_and_one_exact_marker() {
+        assert_eq!(observed_modules(&observation(true, 0, "ROOST_MODULES_DISABLED\n")), Some(false));
+        assert_eq!(observed_modules(&observation(true, 0, "ROOST_MODULES_ENABLED\n")), Some(true));
+        for text in ["", "STAGED_ENABLED", "prefix ROOST_MODULES_DISABLED", "ROOST_MODULES_DISABLED\nROOST_MODULES_ENABLED", "ROOST_MODULES_DISABLED\nROOST_MODULES_DISABLED"] {
+            assert_eq!(observed_modules(&observation(true, 0, text)), None);
+        }
+        assert_eq!(observed_modules(&observation(false, 0, "ROOST_MODULES_DISABLED")), None);
+        assert_eq!(observed_modules(&observation(true, 1, "ROOST_MODULES_DISABLED")), None);
+        assert_eq!(observed_process(&observation(true, 1, "ROOST_PROCESS_ABSENT")), None);
+    }
+
+    #[test]
+    fn known_disabled_requires_root_and_all_negative_successful_observations() {
+        assert_eq!(lsposed_observation_state(true, true, Some(false), Some(false), Some(false), None), (true, false, "disabled"));
+        for (root, active, staged, lspd) in [
+            (false, None, None, Some(false)), (false, Some(false), Some(false), Some(false)),
+            (true, None, Some(false), Some(false)), (true, Some(false), None, Some(false)),
+            (true, Some(false), Some(false), None),
+        ] {
+            assert_eq!(lsposed_observation_state(true, root, active, staged, lspd, None), (false, false, "unknown"));
+        }
+        for (active, staged, lspd) in [(Some(true), Some(false), Some(false)),
+            (Some(false), Some(true), Some(false)), (None, None, Some(true))] {
+            assert_eq!(lsposed_observation_state(true, true, active, staged, lspd, None), (false, false, "disable-pending-restart"));
+        }
+    }
+
+    #[test]
+    fn selected_module_requires_exact_unique_id_version_and_successful_envelope() {
+        let selected = "ROOST_SELECTED_BEGIN\nid=zygisk_lsposed\nversion=v1.9.2\nversionCode=7024\nROOST_SELECTED_END\n";
+        assert_eq!(observed_selected_module(&observation(true, 0, selected), "zygisk_lsposed", "1.9.2"), Some(true));
+        assert_eq!(observed_selected_module(&observation(true, 0, selected), "riru_lsposed", "1.9.2"), Some(false));
+        assert_eq!(observed_selected_module(&observation(true, 0, selected), "zygisk_lsposed", "1.9.20"), Some(false));
+        assert_eq!(observed_selected_module(&observation(true, 1, selected), "zygisk_lsposed", "1.9.2"), None);
+        assert_eq!(observed_selected_module(&observation(false, 0, selected), "zygisk_lsposed", "1.9.2"), None);
+        assert_eq!(observed_selected_module(&observation(true, 0, "ROOST_SELECTED_ABSENT\n"), "zygisk_lsposed", "1.9.2"), Some(false));
+        for text in ["id=zygisk_lsposed\nversion=1.9.2", "ROOST_SELECTED_BEGIN\nid=zygisk_lsposed\nid=riru_lsposed\nversion=1.9.2\nROOST_SELECTED_END",
+            "ROOST_SELECTED_BEGIN\nid=zygisk_lsposed\nversion=1.9.2\nversion=1.9.2\nROOST_SELECTED_END",
+            "ROOST_SELECTED_BEGIN\nid=zygisk_lsposed\nversion=1.9.2 test\nROOST_SELECTED_END\nError: failed"] {
+            assert_eq!(observed_selected_module(&observation(true, 0, text), "zygisk_lsposed", "1.9.2"), None);
+        }
+    }
+
+    #[test]
+    fn real_lsposed_release_version_accepts_only_exact_matching_decimal_build() {
+        // Literal fields read from LSPosed-v1.9.2-7024-zygisk-release.zip module.prop.
+        let fixture = "ROOST_SELECTED_BEGIN\nid=zygisk_lsposed\nname=Zygisk - LSPosed\nversion=v1.9.2 (7024)\nversionCode=7024\nROOST_SELECTED_END\n";
+        assert_eq!(observed_selected_module(&observation(true, 0, fixture), "zygisk_lsposed", "1.9.2"), Some(true));
+        assert_eq!(observed_selected_module(&observation(true, 0, fixture), "zygisk_lsposed", "v1.9.2"), Some(true));
+        assert_eq!(observed_selected_module(&observation(true, 0, fixture), "zygisk_lsposed", "1.9.20"), Some(false));
+        for (actual, codes) in [("v1.9.2 (7024)", "versionCode=7025\n"), ("v1.9.2 (7024)", ""),
+            ("v1.9.2 (7024)", "versionCode=7024\nversionCode=7024\n"),
+            ("v1.9.2", "versionCode=7024\nversionCode=7025\n"),
+            ("v1.9.2 (7024)", "versionCode=07024\n"), ("v1.9.2 (7024)", "versionCode=7024x\n"),
+            ("v1.9.2  (7024)", "versionCode=7024\n"), ("v1.9.2\t(7024)", "versionCode=7024\n"),
+            ("v1.9.2 (7024) ", "versionCode=7024\n"), ("v1.9.2 (7024) junk", "versionCode=7024\n"),
+            ("v1.9.2 test", "versionCode=7024\n"), ("v1.9.2 ()", "versionCode=7024\n"),
+            ("v1.9.2 (+7024)", "versionCode=7024\n"), ("v1.9.2 (７０２４)", "versionCode=7024\n")] {
+            let text = format!("ROOST_SELECTED_BEGIN\nid=zygisk_lsposed\nversion={actual}\n{codes}ROOST_SELECTED_END\n");
+            assert_eq!(observed_selected_module(&observation(true, 0, &text), "zygisk_lsposed", "1.9.2"), None, "{text}");
+        }
+        for actual in ["v1.9.20", "v1.9.20 (7024)", "vv1.9.2", "v1.9.2(7024)"] {
+            let text = format!("ROOST_SELECTED_BEGIN\nid=zygisk_lsposed\nversion={actual}\nversionCode=7024\nROOST_SELECTED_END\n");
+            assert_eq!(observed_selected_module(&observation(true, 0, &text), "zygisk_lsposed", "1.9.2"), Some(false), "{text}");
+        }
+        let no_suffix = "ROOST_SELECTED_BEGIN\nid=zygisk_lsposed\nversion=v1.9.2\nROOST_SELECTED_END";
+        assert_eq!(observed_selected_module(&observation(true, 0, no_suffix), "zygisk_lsposed", "1.9.2"), Some(true));
+    }
+
+    #[test]
+    fn verification_result_serializes_same_boot_identity_with_existing_fields() {
+        let boot_id = "12345678-1234-4abc-8def-123456789abc";
+        let value = serde_json::to_value(VerifyVmResult {
+            root_verified: false, lsp_verified: false, lsp_installed: false,
+            lsp_state: "unknown".into(), pending_restart: true, message: "pure fixture".into(), boot_id: boot_id.into(),
+        }).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert_eq!(value["boot_id"], boot_id);
+        assert_eq!(value["root_verified"], false);
+        assert_eq!(value["lsp_verified"], false);
+        assert_eq!(value["lsp_installed"], false);
+        assert_eq!(value["lsp_state"], "unknown");
+        assert_eq!(value["pending_restart"], true);
+        assert_eq!(value["message"], "pure fixture");
+    }
+
+    #[test]
+    fn installed_or_process_present_never_proves_framework_activation() {
+        for (lspd, expected) in [(Some(true), "running-unverified"), (Some(false), "installed-not-running")] {
+            assert_eq!(lsposed_observation_state(false, true, Some(true), Some(false), lspd, Some(true)), (false, true, expected));
+        }
+        for (root, active, staged, lspd, selected) in [(false, None, None, Some(true), None),
+            (true, Some(true), None, Some(true), Some(true)), (true, None, Some(false), Some(true), Some(true)),
+            (true, Some(true), Some(false), None, Some(true))] {
+            assert_eq!(lsposed_observation_state(false, root, active, staged, lspd, selected), (false, false, "unknown"));
+        }
+        assert_eq!(lsposed_observation_state(false, true, Some(false), Some(false), Some(false), Some(false)), (false, false, "not-installed"));
+    }
+
+    #[test]
+    fn magisk_version_requires_exact_single_line_and_success_exit_code() {
+        assert!(observed_magisk_version(&observation(true, 0, "28.0:MAGISK:R\n"), "v28.0"));
+        for (ok, code, output) in [(false, 0, "28.0:MAGISK:R"), (true, 1, "28.0:MAGISK:R"),
+            (true, 0, "28.00:MAGISK:R"), (true, 0, "28.0:MAGISK:R\nError: failed"), (true, 0, "")] {
+            assert!(!observed_magisk_version(&observation(ok, code, output), "28.0"));
+        }
+    }
 }
 
 /// Explicit setup action; source APK/resources are versioned and copied only to this VM.

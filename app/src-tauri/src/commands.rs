@@ -59,7 +59,7 @@ pub fn get_vm(vm_id: String) -> Result<VmConfig> {
 
 #[tauri::command]
 pub fn save_vm(state: State<'_, AppState>, mut config: VmConfig) -> Result<()> {
-    let _operation = state.vm_manager.operation(&config.id)?;
+    let _operation = state.vm_manager.lifecycle_operation(&config.id)?;
     config.validate()?;
     let previous = VmConfig::load(&config.id)?;
     if state.vm_manager.is_running(&config.id)
@@ -83,7 +83,7 @@ pub fn save_vm(state: State<'_, AppState>, mut config: VmConfig) -> Result<()> {
 
 #[tauri::command]
 pub fn delete_vm(state: State<'_, AppState>, vm_id: String) -> Result<()> {
-    let _operation = state.vm_manager.operation(&vm_id)?;
+    let _operation = state.vm_manager.lifecycle_operation(&vm_id)?;
     validate_component(&vm_id)?;
     if state.vm_manager.is_running(&vm_id) { return Err(Error::Other("请先停止该 VM 再删除".into())); }
     let dir = vms_dir().join(&vm_id);
@@ -183,6 +183,54 @@ pub fn get_overlay(overlay_id: String) -> Result<OverlayInfo> {
 
 // ------------------------------------------------------------------ ADB
 
+/// Guest framebuffer only; VM identity comes exclusively from this AppState's manager.
+#[tauri::command]
+pub async fn capture_vm_guest(state: State<'_, AppState>, vm_id: String) -> Result<crate::guest::CaptureVmGuestResult> {
+    let _operation = state.vm_manager.interaction(&vm_id)?;
+    let adb = state.vm_manager.adb_for_vm(&vm_id)?;
+    crate::guest::capture(vm_id, &adb).await
+}
+
+/// One explicit user point in the guest image; never host input or an automatic grant.
+#[tauri::command]
+pub async fn tap_vm_guest(
+    state: State<'_, AppState>, vm_id: String, x: u32, y: u32,
+    expected_width: u32, expected_height: u32, expected_boot_id: String,
+) -> Result<crate::adb::CmdResult> {
+    crate::guest::validate_tap_request(x, y, expected_width, expected_height, &expected_boot_id)?;
+    let _operation = state.vm_manager.interaction(&vm_id)?;
+    let adb = state.vm_manager.adb_for_vm(&vm_id)?;
+    crate::guest::tap(&adb, x, y, expected_width, expected_height, &expected_boot_id).await
+}
+
+/// No install, force-stop, data clearing or user-supplied activity/command/path.
+#[tauri::command]
+pub async fn launch_vm_app(state: State<'_, AppState>, vm_id: String, package_name: String) -> Result<crate::adb::CmdResult> {
+    crate::adb::validate_launch_package(&package_name)?;
+    let _operation = state.vm_manager.operation(&vm_id)?;
+    let adb = state.vm_manager.adb_for_vm(&vm_id)?;
+    adb.launch_launcher(&package_name).await
+}
+
+/// Nonroot boot observation; never requests root or mutates applied state.
+#[tauri::command]
+pub async fn vm_boot_status(state: State<'_, AppState>, vm_id: String) -> Result<crate::adb::VmBootStatus> {
+    let _operation = state.vm_manager.operation(&vm_id)?;
+    state.vm_manager.adb_for_vm(&vm_id)?.boot_status().await
+}
+
+/// Only this explicit user action may wait for a new Magisk Shell decision.
+#[tauri::command]
+pub async fn request_vm_root(state: State<'_, AppState>, vm_id: String) -> Result<crate::adb::CmdResult> {
+    let _operation = state.vm_manager.operation(&vm_id)?;
+    let adb = state.vm_manager.adb_for_vm(&vm_id)?;
+    let running = state.vm_manager.running_config(&vm_id)?;
+    if !running.root_manager.starts_with("magisk@") {
+        return Err(Error::Command("当前运行的VM未选择Magisk；未发送Root请求".into()));
+    }
+    adb.su_id_request().await
+}
+
 #[tauri::command]
 pub async fn adb_connect(state: State<'_, AppState>, vm_id: String) -> Result<bool> {
     let _operation = state.vm_manager.operation(&vm_id)?;
@@ -266,11 +314,11 @@ pub async fn install_magisk_module(state: State<'_, AppState>, vm_id: String, pa
     let c = state.vm_manager.running_config(&vm_id)?;
     if !c.root_manager.starts_with("magisk@") { return Err(Error::Other("当前运行的VM未选择Magisk".into())); }
     let adb = state.vm_manager.adb_for_vm(&vm_id)?;
-    let boot = adb.shell("cat /proc/sys/kernel/random/boot_id").await?;
-    if !boot.ok || boot.stdout.trim().is_empty() { return Err(Error::Other("读取目标VM boot_id失败".into())); }
+    let boot_id = crate::guest::current_boot(&adb).await?;
     let result = crate::managed::install_zip(&adb, &c, &path).await?;
+    crate::guest::require_same_boot(&boot_id, &crate::guest::current_boot(&adb).await?)?;
     let mut saved = VmConfig::load(&vm_id)?;
-    saved.module_pending_boot_id = Some(boot.stdout.trim().into());
+    saved.module_pending_boot_id = Some(boot_id);
     saved.pending_restart = true;
     saved.save()?;
     Ok(result)
@@ -286,25 +334,24 @@ pub async fn apply_vm_lsposed(state: State<'_, AppState>, vm_id: String) -> Resu
     }
     let adb = state.vm_manager.adb_for_vm(&vm_id)?;
     if !adb.is_booted().await || !adb.check_root().await { return Err(Error::Other("目标VM尚未完成启动或未取得root".into())); }
-    let boot = adb.shell("cat /proc/sys/kernel/random/boot_id").await?;
-    if !boot.ok || boot.stdout.trim().is_empty() { return Err(Error::Other("读取目标VM boot_id失败".into())); }
+    let boot_id = crate::guest::current_boot(&adb).await?;
     if c.lsp_desired() == "none" {
-        let result = adb.su_shell(r#"for d in /data/adb/modules/zygisk_lsposed /data/adb/modules/riru_lsposed /data/adb/modules_update/zygisk_lsposed /data/adb/modules_update/riru_lsposed; do [ ! -d "$d" ] || touch "$d/disable"; done"#).await?;
-        if !result.ok { return Err(Error::Command(result.output())); }
-        let mut saved = c; saved.pending_restart = true; saved.module_pending_boot_id = Some(boot.stdout.trim().into()); saved.save()?;
-        return Ok(crate::managed::ModuleInstallResult { ok: true, stdout: result.stdout, stderr: result.stderr, code: result.code,
-            needs_reboot: true, module_id: "lsposed-disabled".into() });
+        let result = crate::managed::disable_lsposed(&adb).await?;
+        crate::guest::require_same_boot(&boot_id, &crate::guest::current_boot(&adb).await?)?;
+        let mut saved = c; saved.pending_restart = true; saved.module_pending_boot_id = Some(boot_id); saved.save()?;
+        return Ok(result);
     }
     if c.lsp_desired().ends_with("-riru") {
         return Err(Error::Other("自动基线暂仅支持1.9.2 Zygisk；Riru依赖需手动准备".into()));
     }
     let zygisk = adb.su_shell(&format!(r#"{} --sqlite 'SELECT value FROM settings WHERE key="zygisk"'"#, c.magisk_path)).await?;
-    if !zygisk.ok || !zygisk.stdout.contains("value=1") {
+    if !zygisk.ok || zygisk.code != 0 || zygisk.stdout.trim() != "value=1" {
         return Err(Error::Other("请在该VM的Magisk管理器启用Zygisk并重启后再应用LSPosed".into()));
     }
     let path = crate::managed::lsposed_package(c.lsp_desired())?;
-    let result = crate::managed::install_zip(&adb, &running, &path.to_string_lossy()).await?;
-    let mut saved = c; saved.pending_restart = true; saved.module_pending_boot_id = Some(boot.stdout.trim().into()); saved.save()?;
+    let result = crate::managed::install_lsposed_zip(&adb, &running, &path.to_string_lossy(), c.lsp_desired()).await?;
+    crate::guest::require_same_boot(&boot_id, &crate::guest::current_boot(&adb).await?)?;
+        let mut saved = c; saved.pending_restart = true; saved.module_pending_boot_id = Some(boot_id); saved.save()?;
     Ok(result)
 }
 
@@ -319,24 +366,38 @@ fn runtime_pending_restart(desired: &VmConfig, running: &VmConfig, reboot_pendin
         || desired.lsp_applied.as_deref() != Some(desired.lsp_desired())
 }
 
+// Pure reconciliation: validate all boot evidence before deriving a new saved state.
+// A failed or installed-only observation clears stale applied strings, never fabricates proof.
+fn reconcile_runtime_observation(
+    desired: &VmConfig, running: &VmConfig, observation: &crate::managed::VerifyVmResult,
+) -> Result<VmConfig> {
+    crate::guest::require_same_boot(&observation.boot_id, &observation.boot_id)?;
+    let reboot_pending = if let Some(previous) = desired.module_pending_boot_id.as_deref() {
+        crate::guest::require_same_boot(previous, previous)?;
+        previous == observation.boot_id.as_str()
+    } else { false };
+    let mut saved = desired.clone();
+    saved.root_applied = observation.root_verified.then(|| running.root_manager.clone());
+    saved.lsp_applied = observation.lsp_verified.then(|| desired.lsp_desired().to_string());
+    saved.lsp_state = observation.lsp_state.clone();
+    if !reboot_pending { saved.module_pending_boot_id = None; }
+    saved.pending_restart = runtime_pending_restart(&saved, running, reboot_pending, observation.root_verified);
+    Ok(saved)
+}
+
 #[tauri::command]
 pub async fn verify_vm_runtime(state: State<'_, AppState>, vm_id: String) -> Result<crate::managed::VerifyVmResult> {
     let _operation = state.vm_manager.operation(&vm_id)?;
     let running = state.vm_manager.running_config(&vm_id)?;
-    let mut desired = VmConfig::load(&vm_id)?;
-    // Root must be verified against the booted choice, LSP against the latest explicitly applied selection.
+    let desired = VmConfig::load(&vm_id)?;
+    // Root is checked against the owned launch snapshot, LSP against the desired selection.
     let mut expected = running.clone(); expected.lsp_version = desired.lsp_version.clone();
-    let mut result = crate::managed::verify_vm(&state.vm_manager.adb_for_vm(&vm_id)?, &expected).await?;
-    if result.root_verified { desired.root_applied = Some(running.root_manager.clone()); } else { desired.root_applied = None; }
-    if result.lsp_verified || result.lsp_installed { desired.lsp_applied = Some(desired.lsp_desired().to_string()); } else { desired.lsp_applied = None; }
-    desired.lsp_state = result.lsp_state.clone();
-    let boot = state.vm_manager.adb_for_vm(&vm_id)?.shell("cat /proc/sys/kernel/random/boot_id").await?;
-    let reboot_pending = desired.module_pending_boot_id.as_deref()
-        .map(|id| !boot.ok || boot.stdout.trim().is_empty() || id == boot.stdout.trim()).unwrap_or(false);
-    if !reboot_pending { desired.module_pending_boot_id = None; }
-    result.pending_restart = runtime_pending_restart(&desired, &running, reboot_pending, result.root_verified);
-    desired.pending_restart = result.pending_restart;
-    desired.save()?;
+    let adb = state.vm_manager.adb_for_vm(&vm_id)?;
+    let mut result = crate::managed::verify_vm(&adb, &expected).await?;
+    let saved = reconcile_runtime_observation(&desired, &running, &result)?;
+    crate::guest::require_same_boot(&result.boot_id, &crate::guest::current_boot(&adb).await?)?;
+    result.pending_restart = saved.pending_restart;
+    saved.save()?;
     Ok(result)
 }
 
@@ -702,8 +763,97 @@ pub fn restore_kernel_backup() -> Result<()> {
 }
 
 #[cfg(test)]
+mod guest_command_tests {
+    use crate::vm::VmManager;
+
+    // Empty managers and lease maps only; no configs, files, child processes or ADB.
+    #[test]
+    fn guest_commands_require_owned_running_vm_and_exclusive_operation() {
+        let owner = VmManager::new();
+        let other = VmManager::new();
+        let lease = owner.operation("guest-fixture").unwrap();
+        let interaction = owner.interaction("guest-fixture").unwrap();
+        assert!(owner.operation("guest-fixture").is_err());
+        assert!(owner.interaction("guest-fixture").is_err());
+        assert!(owner.lifecycle_operation("guest-fixture").is_err());
+        drop(interaction);
+        assert!(owner.adb_for_vm("guest-fixture").is_err());
+        assert!(other.adb_for_vm("guest-fixture").is_err());
+        assert!(other.operation("guest-fixture").is_ok());
+        drop(lease);
+        assert!(owner.operation("guest-fixture").is_ok());
+    }
+}
+
+#[cfg(test)]
 mod runtime_state_tests {
-    use super::runtime_pending_restart;
+    use super::{runtime_pending_restart, reconcile_runtime_observation};
+
+    const BOOT: &str = "12345678-1234-1234-1234-123456789abc";
+    const NEXT_BOOT: &str = "abcdef12-1234-1234-1234-123456789abc";
+
+    fn observation(root_verified: bool, lsp_verified: bool, lsp_installed: bool) -> crate::managed::VerifyVmResult {
+        crate::managed::VerifyVmResult {
+            root_verified, lsp_verified, lsp_installed,
+            lsp_state: if lsp_verified { "disabled" } else { "running-unverified" }.into(),
+            pending_restart: false, message: "pure fixture".into(), boot_id: BOOT.into(),
+        }
+    }
+
+    #[test]
+    fn installed_only_never_becomes_applied_or_clears_pending() {
+        let mut desired = matched();
+        desired.lsp_version = Some("1.9.2-zygisk".into());
+        desired.lsp_applied = Some("1.9.2-zygisk".into()); // stale previous success
+        let result = reconcile_runtime_observation(&desired, &desired, &observation(true, false, true)).unwrap();
+        assert!(result.lsp_applied.is_none());
+        assert!(result.pending_restart);
+        assert_eq!(result.lsp_state, "running-unverified");
+        assert_eq!(desired.lsp_applied.as_deref(), Some("1.9.2-zygisk")); // input not mutated
+    }
+
+    #[test]
+    fn failed_observation_clears_stale_root_and_framework_proof() {
+        let desired = matched();
+        let result = reconcile_runtime_observation(&desired, &desired, &observation(false, false, false)).unwrap();
+        assert!(result.root_applied.is_none());
+        assert!(result.lsp_applied.is_none());
+        assert!(result.pending_restart);
+    }
+
+    #[test]
+    fn verified_disable_requires_new_boot_when_module_change_is_pending() {
+        let mut desired = matched();
+        desired.module_pending_boot_id = Some(BOOT.into());
+        let current = reconcile_runtime_observation(&desired, &desired, &observation(true, true, false)).unwrap();
+        assert_eq!(current.lsp_applied.as_deref(), Some("none"));
+        assert_eq!(current.module_pending_boot_id.as_deref(), Some(BOOT));
+        assert!(current.pending_restart);
+        let mut next = observation(true, true, false); next.boot_id = NEXT_BOOT.into();
+        let after = reconcile_runtime_observation(&desired, &desired, &next).unwrap();
+        assert!(after.module_pending_boot_id.is_none());
+        assert!(!after.pending_restart);
+    }
+
+    #[test]
+    fn malformed_observed_or_pending_boot_never_reconciles() {
+        let desired = matched();
+        for invalid in ["", "changed", "12345678-1234-1234-1234-123456789ABC"] {
+            let mut report = observation(true, true, false); report.boot_id = invalid.into();
+            assert!(reconcile_runtime_observation(&desired, &desired, &report).is_err());
+            let mut pending = desired.clone(); pending.module_pending_boot_id = Some(invalid.into());
+            assert!(reconcile_runtime_observation(&pending, &pending, &observation(true, true, false)).is_err());
+        }
+    }
+
+    #[test]
+    fn changed_desired_root_is_not_verified_by_previous_running_choice() {
+        let running = matched();
+        let mut desired = running.clone(); desired.root_manager = "magisk@29.0".into();
+        let saved = reconcile_runtime_observation(&desired, &running, &observation(true, true, false)).unwrap();
+        assert_eq!(saved.root_applied.as_deref(), Some("magisk@28.0"));
+        assert!(saved.pending_restart);
+    }
     use crate::types::VmConfig;
     use serde_json::json;
 

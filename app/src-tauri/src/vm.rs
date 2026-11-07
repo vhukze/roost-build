@@ -39,11 +39,26 @@ impl RunningVm {
     }
 }
 
+/// Separate device and guest-interaction lanes share one exclusive lifecycle gate.
+#[derive(Default)]
+struct VmOperationLocks {
+    lifecycle: Arc<tokio::sync::RwLock<()>>,
+    device: Arc<tokio::sync::Mutex<()>>,
+    interaction: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Keep the lane and lifecycle read lease for the caller's entire async operation.
+/// Field order releases the lane before lifecycle, so a writer never races a lane.
+pub struct VmOperationGuard {
+    _lane: tokio::sync::OwnedMutexGuard<()>,
+    _lifecycle: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
 /// 全局虚拟机管理器
 #[derive(Clone)]
 pub struct VmManager {
     inner: Arc<Mutex<HashMap<String, RunningVm>>>,
-    operations: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    operations: Arc<Mutex<HashMap<String, Arc<VmOperationLocks>>>>,
 }
 
 /// 启动结果
@@ -71,12 +86,36 @@ impl VmManager {
         }
     }
 
-    /// All device mutations and lifecycle transitions share an instance-scoped lease.
-    pub fn operation(&self, vm_id: &str) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+    fn operation_locks(&self, vm_id: &str) -> Result<Arc<VmOperationLocks>> {
         validate_component(vm_id)?;
-        let mutex = self.operations.lock().entry(vm_id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
-        mutex.try_lock_owned().map_err(|_| Error::Other("目标VM正在执行另一操作，请稍后重试".into()))
+        Ok(self.operations.lock().entry(vm_id.to_string())
+            .or_insert_with(|| Arc::new(VmOperationLocks::default())).clone())
+    }
+
+    /// Ordinary device commands remain exclusive, but do not block screenshot/tap.
+    pub fn operation(&self, vm_id: &str) -> Result<VmOperationGuard> {
+        let locks = self.operation_locks(vm_id)?;
+        let lifecycle = locks.lifecycle.clone().try_read_owned()
+            .map_err(|_| Error::Other("目标VM正在切换生命周期，请稍后重试".into()))?;
+        let lane = locks.device.clone().try_lock_owned()
+            .map_err(|_| Error::Other("目标VM正在执行另一设备操作，请稍后重试".into()))?;
+        Ok(VmOperationGuard { _lane: lane, _lifecycle: lifecycle })
+    }
+
+    /// Guest capture/tap serialize with each other while an explicit su may wait.
+    pub fn interaction(&self, vm_id: &str) -> Result<VmOperationGuard> {
+        let locks = self.operation_locks(vm_id)?;
+        let lifecycle = locks.lifecycle.clone().try_read_owned()
+            .map_err(|_| Error::Other("目标VM正在切换生命周期，请稍后重试".into()))?;
+        let lane = locks.interaction.clone().try_lock_owned()
+            .map_err(|_| Error::Other("目标VM正在采集或点击Guest画面，请稍后重试".into()))?;
+        Ok(VmOperationGuard { _lane: lane, _lifecycle: lifecycle })
+    }
+
+    /// Fail fast until both lanes release their read leases; never queue a writer.
+    pub fn lifecycle_operation(&self, vm_id: &str) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        self.operation_locks(vm_id)?.lifecycle.clone().try_write_owned()
+            .map_err(|_| Error::Other("目标VM有进行中的操作或生命周期切换，请稍后重试".into()))
     }
 
     pub fn adb_for_vm(&self, vm_id: &str) -> Result<crate::adb::Adb> {
@@ -94,11 +133,19 @@ impl VmManager {
     /// Launch guard prevents duplicate processes, including during preparation.
     pub async fn launch(&self, vm_id: &str, headless: bool) -> Result<LaunchResult> {
         validate_component(vm_id)?;
-        let _operation = self.operation(vm_id)?;
-        self.launch_inner(vm_id, headless).await
+        let _operation = self.lifecycle_operation(vm_id)?;
+        self.launch_inner(VmConfig::load(vm_id)?, headless).await
     }
 
-    async fn launch_inner(&self, vm_id: &str, headless: bool) -> Result<LaunchResult> {
+    /// Use the caller's validated snapshot without reloading the target serial.
+    pub(crate) async fn launch_captured(&self, config: VmConfig, headless: bool) -> Result<LaunchResult> {
+        config.validate()?;
+        let _operation = self.lifecycle_operation(&config.id)?;
+        self.launch_inner(config, headless).await
+    }
+
+    async fn launch_inner(&self, config: VmConfig, headless: bool) -> Result<LaunchResult> {
+        let vm_id = config.id.as_str();
         // Refresh stale child state before checking duplicate launch.
         self.is_running(vm_id);
         {
@@ -113,8 +160,6 @@ impl VmManager {
                 });
             }
         }
-
-        let config = VmConfig::load(vm_id)?;
 
         config.validate()?;
         if config.backend == "legacy-qemu" {
@@ -240,7 +285,7 @@ impl VmManager {
 
     /// 停止虚拟机
     pub async fn stop(&self, vm_id: &str) -> Result<String> {
-        let _operation = self.operation(vm_id)?;
+        let _operation = self.lifecycle_operation(vm_id)?;
         let mut running = {
             let mut map = self.inner.lock();
             map.remove(vm_id)
@@ -250,15 +295,22 @@ impl VmManager {
             Some(mut vm) => {
                 let result: Result<()> = async {
                     if vm.config.backend == "android-emulator" {
-                        let adb = crate::adb::Adb::for_vm(&vm.config)?;
-                        let graceful = adb.emulator_kill().await.map(|result| result.ok).unwrap_or(false);
-                        if graceful {
-                            let _ = tokio::time::timeout(std::time::Duration::from_secs(25), vm.child.wait()).await;
+                        // Windows uses only the retained Job handle. A serial/port
+                        // is not ownership: another emulator may reuse it after exit.
+                        #[cfg(not(windows))]
+                        {
+                            let adb = crate::adb::Adb::for_vm(&vm.config)?;
+                            let graceful = adb.emulator_kill().await.map(|result| result.ok).unwrap_or(false);
+                            if graceful {
+                                let _ = tokio::time::timeout(std::time::Duration::from_secs(25), vm.child.wait()).await;
+                            }
                         }
-                        // ADB can be absent before guest registration or during a hang.
-                        // The retained Job handle identifies only this launch's tree,
-                        // including descendants after the launcher exits.
+                        // The retained Job includes descendants after launcher exit;
+                        // no process is selected for termination by name or serial.
                         vm.stop_owned_tree().await?;
+                        // A reused port does not revive a completed Windows Job.
+                        #[cfg(not(windows))]
+                        {
                         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
                         loop {
                             let free = [vm.config.console_port, vm.config.console_port + 1].iter()
@@ -266,6 +318,7 @@ impl VmManager {
                             if free { break; }
                             if std::time::Instant::now() >= deadline { return Err(Error::Other("Emulator端口未释放，保留ownership待重试".into())); }
                             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        }
                         }
                     } else {
                         vm.stop_owned_tree().await?;
@@ -276,7 +329,7 @@ impl VmManager {
                     self.inner.lock().insert(vm_id.to_string(), vm);
                     return Err(error);
                 }
-                Ok("已停止该VM并确认Emulator端口释放".into())
+                Ok("该VM本会话持有的进程树已停止；未接管同端口的外部实例".into())
             }
             None => Ok("虚拟机未运行".into()),
         }
@@ -291,8 +344,11 @@ impl VmManager {
                 Ok(Some(_)) => {
                     #[cfg(windows)]
                     if vm.job.active_processes().map(|count| count > 0).unwrap_or(true) { return true; }
+                    #[cfg(not(windows))]
                     if vm.config.backend == "android-emulator" && [vm.config.console_port, vm.config.console_port + 1].iter()
                         .any(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_err()) { return true; }
+                    // On Windows an empty retained Job is definitive. Reused
+                    // ports belong to a different launch, not to this manager.
                     map.remove(vm_id);
                     false
                 }
@@ -337,6 +393,67 @@ impl VmManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod operation_lane_tests {
+    use super::VmManager;
+
+    // Lock maps only: no configs, process handles, ADB, files or Tokio runtime.
+    #[test]
+    fn ordinary_and_interaction_lanes_coexist_but_each_lane_is_exclusive() {
+        let manager = VmManager::new();
+        let device = manager.operation("fixture").unwrap();
+        let interaction = manager.interaction("fixture").unwrap();
+        assert!(manager.operation("fixture").is_err());
+        assert!(manager.interaction("fixture").is_err());
+        assert!(manager.lifecycle_operation("fixture").is_err());
+        drop(device);
+        assert!(manager.lifecycle_operation("fixture").is_err());
+        drop(interaction);
+        assert!(manager.lifecycle_operation("fixture").is_ok());
+    }
+
+    #[test]
+    fn lifecycle_gate_excludes_both_lanes_and_other_writers() {
+        let manager = VmManager::new();
+        let lifecycle = manager.lifecycle_operation("fixture").unwrap();
+        assert!(manager.operation("fixture").is_err());
+        assert!(manager.interaction("fixture").is_err());
+        assert!(manager.lifecycle_operation("fixture").is_err());
+        drop(lifecycle);
+        let interaction = manager.interaction("fixture").unwrap();
+        let device = manager.operation("fixture").unwrap();
+        drop(interaction);
+        assert!(manager.lifecycle_operation("fixture").is_err());
+        drop(device);
+        assert!(manager.lifecycle_operation("fixture").is_ok());
+    }
+
+    #[test]
+    fn clones_share_lanes_but_vm_ids_and_manager_instances_are_independent() {
+        let manager = VmManager::new();
+        let clone = manager.clone();
+        let other = VmManager::new();
+        let _device = manager.operation("fixture").unwrap();
+        assert!(clone.operation("fixture").is_err());
+        let _interaction = clone.interaction("fixture").unwrap();
+        assert!(manager.interaction("fixture").is_err());
+        assert!(clone.lifecycle_operation("fixture").is_err());
+        assert!(manager.lifecycle_operation("different-vm").is_ok());
+        assert!(other.lifecycle_operation("fixture").is_ok());
+    }
+
+    #[test]
+    fn all_lanes_reject_invalid_vm_identity_before_creating_lock_entries() {
+        let manager = VmManager::new();
+        for id in ["", ".", "..", "../other", "vm/other", "vm\\other", "vm id", "vm;id", "vm\n"] {
+            assert!(manager.operation(id).is_err(), "{id:?}");
+            assert!(manager.interaction(id).is_err(), "{id:?}");
+            assert!(manager.lifecycle_operation(id).is_err(), "{id:?}");
+        }
+        assert!(manager.operations.lock().is_empty());
     }
 }
 

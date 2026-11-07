@@ -12,6 +12,8 @@ pub mod compat;
 pub mod diagnose;
 pub mod packages;
 pub mod ghcache;
+pub mod guest;
+pub mod headless;
 pub mod proxy;
 pub mod root;
 pub mod roots;
@@ -92,7 +94,12 @@ pub fn run() {
             // ADB
             commands::adb_connect,
             commands::adb_device_info,
+            commands::vm_boot_status,
+            commands::request_vm_root,
             commands::adb_list_packages,
+            commands::capture_vm_guest,
+            commands::tap_vm_guest,
+            commands::launch_vm_app,
             commands::adb_install,
             commands::install_magisk_module,
             commands::initialize_vm_magisk,

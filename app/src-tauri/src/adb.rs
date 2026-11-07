@@ -27,6 +27,13 @@ impl CmdResult {
     }
 }
 
+/// Nonroot boot observation; false is a native observation, not a string fallback.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VmBootStatus {
+    pub boot_completed: bool,
+    pub serial: String,
+}
+
 /// 设备信息
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DeviceInfo {
@@ -38,6 +45,8 @@ pub struct DeviceInfo {
     pub abi: String,
     pub debuggable: String,
     pub root: bool,
+    /// Observational device_info never prompts for root; false means untested.
+    pub root_checked: bool,
 }
 
 impl Default for DeviceInfo {
@@ -51,6 +60,7 @@ impl Default for DeviceInfo {
             abi: String::new(),
             debuggable: String::new(),
             root: false,
+            root_checked: false,
         }
     }
 }
@@ -90,8 +100,13 @@ impl Adb {
         } else { "/system/bin/su".into() } })
     }
 
-    /// 执行 adb 命令
+    /// 执行 adb 命令；existing general 20s / install 180s defaults stay unchanged.
     async fn run(&self, args: &[&str]) -> Result<CmdResult> {
+        let seconds = if args.iter().any(|v| *v == "install" || *v == "push" || v.contains("--install-module")) { 180 } else { 20 };
+        self.run_with_timeout(args, seconds).await
+    }
+
+    async fn run_with_timeout(&self, args: &[&str], seconds: u64) -> Result<CmdResult> {
         let exe = &self.executable;
         if !exe.exists() {
             return Err(Error::Command("adb 未安装".into()));
@@ -99,7 +114,6 @@ impl Adb {
 
         let mut command = crate::background::async_command(exe);
         command.args(args).stdin(Stdio::null()).kill_on_drop(true);
-        let seconds = if args.iter().any(|v| *v == "install" || *v == "push" || v.contains("--install-module")) { 180 } else { 20 };
         let output = tokio::time::timeout(std::time::Duration::from_secs(seconds), command.output())
             .await.map_err(|_| Error::Other(format!("目标VM ADB命令超时（{seconds}s）；请在Magisk中明确授权Shell后重试")))??;
 
@@ -116,6 +130,103 @@ impl Adb {
         let mut full = vec!["-s", self.serial.as_str()];
         full.extend_from_slice(args);
         self.run(&full).await
+    }
+
+    /// Capture only this serial's guest framebuffer, preserving binary PNG bytes.
+    /// There is deliberately no caller-supplied command or output path.
+    pub async fn capture_png(&self) -> Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+
+        const MAX_PNG_BYTES: u64 = 64 * 1024 * 1024;
+        if !self.executable.is_file() {
+            return Err(Error::Command("adb 未安装".into()));
+        }
+        let mut command = crate::background::async_command(&self.executable);
+        command.args(["-s", self.serial.as_str(), "exec-out", "screencap", "-p"])
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let stdout = child.stdout.take().ok_or_else(|| Error::Other("ADB PNG stdout未接管".into()))?;
+        let stderr = child.stderr.take().ok_or_else(|| Error::Other("ADB PNG stderr未接管".into()))?;
+        let operation = async {
+            let mut png = Vec::new();
+            let mut errors = Vec::new();
+            tokio::try_join!(
+                async { stdout.take(MAX_PNG_BYTES + 1).read_to_end(&mut png).await },
+                async { stderr.take(8193).read_to_end(&mut errors).await }
+            )?;
+            if png.len() as u64 > MAX_PNG_BYTES {
+                return Err(Error::Other("Guest PNG超过64MiB上限".into()));
+            }
+            let status = child.wait().await?;
+            if !status.success() {
+                return Err(Error::Command(format!("Guest screencap失败: {}", String::from_utf8_lossy(&errors))));
+            }
+            validate_guest_png(&png)?;
+            Ok(png)
+        };
+        let result = match tokio::time::timeout(std::time::Duration::from_secs(20), operation).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Other("Guest screencap超时（20s）".into())),
+        };
+        if result.is_err() {
+            // This handle identifies only the helper spawned above, never an emulator.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.kill()).await;
+        }
+        result
+    }
+
+    pub fn serial(&self) -> &str {
+        &self.serial
+    }
+
+    pub(crate) async fn guest_boot_id(&self) -> Result<CmdResult> {
+        self.run_serial(&["shell", "cat", "/proc/sys/kernel/random/boot_id"]).await
+    }
+
+    pub(crate) async fn guest_boot_completed(&self) -> Result<CmdResult> {
+        self.run_serial(&["shell", "getprop", "sys.boot_completed"]).await
+    }
+
+    /// Called only after guest::tap validates the expected boot, PNG size and bounds.
+    /// Decimal u32 coordinates are the only variable tokens; no shell text or key input.
+    pub(crate) async fn tap_guest(&self, x: u32, y: u32) -> Result<CmdResult> {
+        let x = x.to_string();
+        let y = y.to_string();
+        self.run_serial(&["shell", "input", "tap", &x, &y]).await
+    }
+
+    /// Launch only an installed package's MAIN/LAUNCHER activity on this fixed serial.
+    /// Every caller-controlled token is validated before any ADB command is spawned.
+    pub async fn launch_launcher(&self, package_name: &str) -> Result<CmdResult> {
+        validate_launch_package(package_name)?;
+        let installed = self.run_serial(&["shell", "pm", "path", package_name]).await?;
+        if !installed.ok || !installed.stdout.lines().any(|line| {
+            line.trim().strip_prefix("package:").map(|path| path.starts_with('/') && path.ends_with(".apk")).unwrap_or(false)
+        }) {
+            return Err(Error::Command(format!("目标VM未确认已安装包 {package_name}: {}", installed.output())));
+        }
+        let resolved = self.run_serial(&[
+            "shell", "cmd", "package", "resolve-activity", "--brief",
+            "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER",
+            "-p", package_name,
+        ]).await?;
+        if !resolved.ok {
+            return Err(Error::Command(format!("解析Launcher失败: {}", resolved.output())));
+        }
+        let component = parse_launcher_component(package_name, &resolved.stdout).map_err(|error| {
+            Error::Command(format!("{error}; resolve-activity: {}", resolved.output()))
+        })?;
+        // Android's shell interprets '$' in nested Java class names. Single quoting is safe
+        // because the component parser permits only ASCII identifier tokens, dots and '/'.
+        let quoted_component = format!("'{component}'");
+        let result = self.run_serial(&[
+            "shell", "am", "start", "-W", "-a", "android.intent.action.MAIN",
+            "-c", "android.intent.category.LAUNCHER", "-n", &quoted_component,
+        ]).await?;
+        if !launcher_start_succeeded(&result) {
+            return Err(Error::Command(format!("启动Launcher失败: {}", result.output())));
+        }
+        Ok(result)
     }
 
     /// 连接设备
@@ -181,12 +292,37 @@ impl Adb {
         false
     }
 
-    /// 检测 root
+    /// Observe only this owned serial; no su, connection takeover or root prompt.
+    pub async fn boot_status(&self) -> Result<VmBootStatus> {
+        let state = self.run_serial(&["get-state"]).await?;
+        if !state.ok || state.stdout.trim() != "device" {
+            return Ok(VmBootStatus { boot_completed: false, serial: self.serial.clone() });
+        }
+        let completed = self.guest_boot_completed().await?;
+        if !completed.ok {
+            return Err(Error::Command(format!("读取Guest启动状态失败（exit={}）: {}", completed.code, completed.output())));
+        }
+        Ok(VmBootStatus { boot_completed: completed.stdout.trim() == "1", serial: self.serial.clone() })
+    }
+
+    /// Explicit user request only: one fixed id command, waiting at most 90 seconds.
+    /// su_path derives exclusively from a validated owned-running VM configuration.
+    pub async fn su_id_request(&self) -> Result<CmdResult> {
+        if !self.boot_status().await.map_err(|error| Error::Command(error.to_string()))?.boot_completed {
+            return Err(Error::Command("目标VM尚未完成启动；未发送Root请求".into()));
+        }
+        let result = self.run_with_timeout(
+            &["-s", self.serial.as_str(), "shell", self.su_path.as_str(), "-c", "'id'"], 90,
+        ).await.map_err(|error| Error::Command(format!("显式Root请求失败: {error}")))?;
+        if !root_id_succeeded(&result) {
+            return Err(Error::Command(format!("显式Root请求未确认UID 0（exit={}）: {}", result.code, result.output())));
+        }
+        Ok(result)
+    }
+
+    /// Existing explicit verifiers retain their general timeout, with exact UID parsing.
     pub async fn check_root(&self) -> bool {
-        self.su_shell("id")
-            .await
-            .map(|r| r.ok && r.stdout.contains("uid=0"))
-            .unwrap_or(false)
+        self.su_shell("id").await.map(|r| root_id_succeeded(&r)).unwrap_or(false)
     }
 
     /// 采集设备信息
@@ -202,7 +338,9 @@ impl Adb {
         info.sdk = self.getprop("ro.build.version.sdk").await;
         info.abi = self.getprop("ro.product.cpu.abi").await;
         info.debuggable = self.getprop("ro.debuggable").await;
-        info.root = self.check_root().await;
+        // Root is unknown here. Only an explicit request/verifier may invoke su.
+        info.root = false;
+        info.root_checked = false;
 
         if info.model.is_empty() {
             info.connected = false;
@@ -294,5 +432,243 @@ impl Adb {
     /// 文件推送
     pub async fn push(&self, local: &str, remote: &str) -> Result<CmdResult> {
         self.run_serial(&["push", local, remote]).await
+    }
+}
+
+/// Accept the real id UID field only, never uid=00, euid=0 or incidental text.
+fn root_id_succeeded(result: &CmdResult) -> bool {
+    if !result.ok || result.code != 0 || result.stdout.trim().lines().count() != 1 { return false; }
+    let Some(uid) = result.stdout.split_whitespace().next().and_then(|field| field.strip_prefix("uid=")) else { return false; };
+    if uid == "0" { return true; }
+    match uid.split_once('(') {
+        Some(("0", name)) => name.strip_suffix(')').map(|name| !name.is_empty()
+            && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))).unwrap_or(false),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod root_request_tests {
+    use super::*;
+
+    #[test]
+    fn root_request_requires_exit_zero_and_exact_id_uid_field() {
+        let result = |ok, code, stdout: &str| CmdResult { ok, code, stdout: stdout.into(), stderr: String::new() };
+        for stdout in ["uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0\n", "uid=0 gid=0", "uid=0(root)\r\n"] {
+            assert!(root_id_succeeded(&result(true, 0, stdout)), "{stdout}");
+        }
+        for stdout in ["", "uid=00(root) gid=0", "uid=01", "uid=2000(shell) euid=0(root)", "euid=0(root)",
+            "notuid=0", "notice uid=0", "uid=0root", "uid=0()", "uid=0(root)\nError: denied"] {
+            assert!(!root_id_succeeded(&result(true, 0, stdout)), "{stdout}");
+        }
+        assert!(!root_id_succeeded(&result(false, 1, "uid=0(root)")));
+        assert!(!root_id_succeeded(&result(true, 1, "uid=0(root)")));
+    }
+
+    #[test]
+    fn observational_device_info_defaults_never_claim_checked_root() {
+        let value = serde_json::to_value(DeviceInfo::default()).unwrap();
+        assert_eq!(value["root"], false);
+        assert_eq!(value["root_checked"], false);
+        let status = serde_json::to_value(VmBootStatus { boot_completed: false, serial: "emulator-5554".into() }).unwrap();
+        assert_eq!(status["boot_completed"], false);
+        assert_eq!(status["serial"], "emulator-5554");
+        assert_eq!(status.as_object().unwrap().len(), 2);
+    }
+}
+
+/// Android application IDs use dot-separated ASCII segments, beginning with a letter.
+/// Reject flags, whitespace, shell metacharacters, Unicode and empty/oversized segments.
+pub(crate) fn validate_launch_package(package_name: &str) -> Result<()> {
+    let mut segments = 0;
+    let valid = !package_name.is_empty() && package_name.len() <= 255
+        && package_name.split('.').all(|segment| {
+            segments += 1;
+            let mut bytes = segment.bytes();
+            bytes.next().map(|byte| byte.is_ascii_alphabetic()).unwrap_or(false)
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        });
+    if !valid || segments < 2 {
+        return Err(Error::Other("Android包名需为至少两段ASCII标识符，每段以字母开头，仅含字母、数字和下划线".into()));
+    }
+    Ok(())
+}
+
+fn valid_activity_class(class_name: &str) -> bool {
+    let name = class_name.strip_prefix('.').unwrap_or(class_name);
+    !name.is_empty() && name.len() <= 1024 && name.split('.').all(|segment| {
+        let mut bytes = segment.bytes();
+        bytes.next().map(|byte| byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$').unwrap_or(false)
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$')
+    })
+}
+
+/// resolve-activity --brief may precede its one flattened component with priority metadata.
+fn parse_launcher_component(package_name: &str, output: &str) -> Result<String> {
+    validate_launch_package(package_name)?;
+    let mut component = None;
+    for line in output.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if line.starts_with("priority=") && !line.contains('/') { continue; }
+        let (resolved_package, class_name) = line.split_once('/')
+            .ok_or_else(|| Error::Other("目标包未解析到唯一Launcher Activity".into()))?;
+        if component.is_some() || resolved_package != package_name || !valid_activity_class(class_name) {
+            return Err(Error::Other("Launcher组件无效、歧义或归属与目标包不符".into()));
+        }
+        component = Some(line.to_string());
+    }
+    component.ok_or_else(|| Error::Other("目标包没有可启动的Launcher Activity".into()))
+}
+
+/// am start can exit 0 while reporting an Android error; require its affirmative status.
+fn launcher_start_succeeded(result: &CmdResult) -> bool {
+    if !result.ok { return false; }
+    let output = result.output().to_ascii_lowercase();
+    let failed = output.lines().map(str::trim).any(|line| {
+        line.starts_with("error:") || line.starts_with("error type ") || line.starts_with("exception ")
+            || (line.starts_with("java.") && line.contains("exception"))
+            || line.contains("permission denial") || line.contains("permission denied")
+            || line.contains("does not exist") || line.contains("unable to resolve")
+            || line.contains("not allowed") || line.contains("not exported")
+            || (line.starts_with("status:") && line != "status: ok")
+    });
+    !failed && result.stdout.lines().any(|line| line.trim().eq_ignore_ascii_case("Status: ok"))
+}
+
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+/// A failed/truncated adb stream must never be presented as a captured PNG.
+fn validate_guest_png(bytes: &[u8]) -> Result<()> {
+    let invalid = || Error::Other("Guest screencap返回无效或截断PNG".into());
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") { return Err(invalid()); }
+    let mut offset = 8usize;
+    let mut header = false;
+    let mut image = false;
+    while offset < bytes.len() {
+        if bytes.len() - offset < 12 { return Err(invalid()); }
+        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().map_err(|_| invalid())?) as usize;
+        let end = offset.checked_add(12).and_then(|value| value.checked_add(length)).ok_or_else(invalid)?;
+        if end > bytes.len() { return Err(invalid()); }
+        let kind = &bytes[offset + 4..offset + 8];
+        let expected_crc = u32::from_be_bytes(bytes[end - 4..end].try_into().map_err(|_| invalid())?);
+        if png_crc32(&bytes[offset + 4..end - 4]) != expected_crc { return Err(invalid()); }
+        if !header {
+            if kind != b"IHDR" || length != 13 { return Err(invalid()); }
+            let width = u32::from_be_bytes(bytes[offset + 8..offset + 12].try_into().map_err(|_| invalid())?);
+            let height = u32::from_be_bytes(bytes[offset + 12..offset + 16].try_into().map_err(|_| invalid())?);
+            if width == 0 || height == 0 || width > 32768 || height > 32768 { return Err(invalid()); }
+            header = true;
+        } else if kind == b"IHDR" { return Err(invalid()); }
+        if kind == b"IDAT" && length > 0 { image = true; }
+        if kind == b"IEND" {
+            return if length == 0 && image && end == bytes.len() { Ok(()) } else { Err(invalid()) };
+        }
+        offset = end;
+    }
+    Err(invalid())
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    // Pure parsing fixtures only: no SDK, ADB, emulator, files, or processes.
+    #[test]
+    fn package_names_are_strict_ascii_segments() {
+        for package in ["com.example", "com.example_app", "org.example.app2", "io.Example"] {
+            assert!(validate_launch_package(package).is_ok(), "{package}");
+        }
+        for package in ["", "android", ".com.app", "com.app.", "com..app", "com.2app", "com._app",
+            "-p", "com.app;id", "com.app$(id)", "com.app`id`", "com.app app", "com.app\n", "com.应用", "com.app/Activity"] {
+            assert!(validate_launch_package(package).is_err(), "{package:?}");
+        }
+        assert!(validate_launch_package(&format!("com.{}", "x".repeat(252))).is_err());
+    }
+
+    #[test]
+    fn launcher_component_is_unique_valid_and_owned_by_requested_package() {
+        for component in ["com.example/.MainActivity", "com.example/com.example.MainActivity", "com.example/.Main$Nested"] {
+            assert_eq!(parse_launcher_component("com.example", component).unwrap(), component);
+        }
+        assert_eq!(parse_launcher_component("com.example", "priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=true\ncom.example/.Main\n").unwrap(), "com.example/.Main");
+        for output in ["", "No activity found", "com.other/.Main", "com.example/", "com.example/..Main",
+            "com.example/.Main;id", "com.example/.Main'", "com.example/.Main/Extra", "com.example/.主界面",
+            "com.example/.One\ncom.example/.Two", "Error: bad intent\ncom.example/.Main"] {
+            assert!(parse_launcher_component("com.example", output).is_err(), "{output:?}");
+        }
+    }
+
+    #[test]
+    fn activity_manager_text_errors_are_not_successful_exit_codes() {
+        let result = |ok, stdout: &str, stderr: &str| CmdResult {
+            ok, stdout: stdout.into(), stderr: stderr.into(), code: if ok { 0 } else { 1 },
+        };
+        assert!(launcher_start_succeeded(&result(true, "Starting: Intent { ... }\nStatus: ok\nActivity: com.example/.Main\nComplete", "")));
+        assert!(launcher_start_succeeded(&result(true, "Status: ok\nActivity: com.example/.ErrorActivity", "")));
+        assert!(launcher_start_succeeded(&result(true, "Warning: Activity not started, intent has been delivered to currently running top-most instance.\nStatus: ok", "")));
+        assert!(!launcher_start_succeeded(&result(false, "Status: ok", "")));
+        assert!(!launcher_start_succeeded(&result(true, "Starting: Intent { ... }", "")));
+        for output in ["Error type 3\nError: Activity class does not exist.", "Status: timeout", "Status: canceled",
+            "Status: ok\nError: Permission Denial", "Status: ok\njava.lang.SecurityException"] {
+            assert!(!launcher_start_succeeded(&result(true, output, "")), "{output}");
+        }
+        assert!(!launcher_start_succeeded(&result(true, "Status: ok", "Error: permission denied")));
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        output.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        output.extend_from_slice(kind);
+        output.extend_from_slice(data);
+        output.extend_from_slice(&png_crc32(&output[4..]).to_be_bytes());
+        output
+    }
+
+    fn fixture() -> Vec<u8> {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let header = [0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0];
+        png.extend(chunk(b"IHDR", &header));
+        // Valid zlib stream for one transparent RGBA pixel and its filter byte.
+        png.extend(chunk(b"IDAT", &[0x78, 0x9c, 0x63, 0x60, 0x00, 0x02, 0x00, 0x00, 0x05, 0x00, 0x01]));
+        png.extend(chunk(b"IEND", &[]));
+        png
+    }
+
+    #[test]
+    fn png_capture_preserves_binary_and_checks_complete_chunks() {
+        let png = fixture();
+        assert!(validate_guest_png(&png).is_ok());
+        assert_eq!(png_crc32(b"123456789"), 0xcbf4_3926);
+        for end in 0..png.len() { assert!(validate_guest_png(&png[..end]).is_err()); }
+        let mut corrupted = png.clone(); corrupted[45] ^= 1;
+        assert!(validate_guest_png(&corrupted).is_err());
+        let mut trailing = png; trailing.push(0);
+        assert!(validate_guest_png(&trailing).is_err());
+        assert!(validate_guest_png(b"error: device offline").is_err());
+    }
+
+    #[test]
+    fn png_capture_rejects_missing_pixels_or_header() {
+        let mut no_pixels = b"\x89PNG\r\n\x1a\n".to_vec();
+        no_pixels.extend(chunk(b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]));
+        no_pixels.extend(chunk(b"IEND", &[]));
+        assert!(validate_guest_png(&no_pixels).is_err());
+        let mut no_header = b"\x89PNG\r\n\x1a\n".to_vec();
+        no_header.extend(chunk(b"IDAT", &[1]));
+        no_header.extend(chunk(b"IEND", &[]));
+        assert!(validate_guest_png(&no_header).is_err());
     }
 }

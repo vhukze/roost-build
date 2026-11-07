@@ -8,6 +8,7 @@ import { icon } from "./icons";
 import { roostIcon, roostLogo, roostMark } from "./brand";
 import { renderLspPage, renderMagiskModulesPage } from "./pages-modules";
 import { renderImagesPage } from "./pages-images";
+import { createGuestPreview } from "./guest-preview";
 
 // ------------------------------------------------------------------ 类型
 
@@ -63,6 +64,9 @@ const state = {
   overlays: [] as OverlayInfo[],
   currentVmId: null as string | null,
   running: new Set<string>(),
+  starting: new Set<string>(),
+  bootSessions: new Map<string, symbol>(),
+  headless: true,
   logs: [] as LogEntry[],
   managers: [] as RootManager[],
   managersLoading: false,
@@ -506,9 +510,13 @@ function renderVms(view: HTMLElement) {
           </div></div>
         <!-- 操作 -->
         <div class="row">
-          <button class="btn btn-accent btn-lg" id="act-start" ${!vm || running ? "disabled" : ""}>
-            ${icon("play", 13)} 启动
+          <button class="btn btn-accent btn-lg" id="act-start" ${!vm || running || state.starting.has(vm.id) ? "disabled" : ""}>
+            ${icon("play", 13)} ${vm && state.starting.has(vm.id) ? "启动中" : "启动"}
           </button>
+          <label class="text-xs faint" style="display:flex;align-items:center;gap:6px">
+            <input type="checkbox" id="f-headless" ${state.headless ? "checked" : ""} ${running || (vm && state.starting.has(vm.id)) ? "disabled" : ""}>
+            后台运行（不打开模拟器窗口）
+          </label>
           <button class="btn btn-danger" id="act-stop" ${!running ? "disabled" : ""}>
             ${icon("stop", 12)} 停止
           </button>
@@ -555,7 +563,14 @@ function renderVms(view: HTMLElement) {
 
   view.querySelector("#btn-add")?.addEventListener("click", createVm);
   view.querySelector("#btn-del")?.addEventListener("click", deleteVm);
+  if (vm && running) {
+    const consolePanel = view.querySelector("#console")?.closest(".panel");
+    consolePanel?.insertAdjacentElement("beforebegin", createGuestPreview(vm.id));
+  }
   view.querySelector("#act-start")?.addEventListener("click", startVm);
+  view.querySelector<HTMLInputElement>("#f-headless")?.addEventListener("change", (event) => {
+    state.headless = (event.currentTarget as HTMLInputElement).checked;
+  });
   view.querySelector("#act-stop")?.addEventListener("click", stopVm);
   view.querySelector("#btn-clear")?.addEventListener("click", () => {
     state.logs = [];
@@ -586,8 +601,16 @@ function renderVms(view: HTMLElement) {
 
     const mgr = view.querySelector<HTMLSelectElement>("#f-root")!.value;
     const ver = view.querySelector<HTMLSelectElement>("#f-root-ver");
-    v.root_manager =
-      mgr === "none" ? "none" : ver?.value ? `${mgr}@${ver.value}` : v.prepared_root.startsWith("magisk@") ? v.prepared_root : "none";
+    if (mgr === "none") {
+      v.root_manager = "none";
+    } else if (ver?.value) {
+      v.root_manager = `${mgr}@${ver.value}`;
+    } else if (v.prepared_root.startsWith(`${mgr}@`) && v.prepared_root.length > mgr.length + 1) {
+      v.root_manager = v.prepared_root;
+    } else {
+      log(`请先为 ${mgr} 选择或填写匹配版本；原配置保持不变`, "warn");
+      return;
+    }
 
     try {
       await api.saveVm(v);
@@ -1040,7 +1063,7 @@ function devicePageTarget(view: HTMLElement, title: string, subtitle: string): V
 }
 
 function renderApps(view: HTMLElement) {
-  const vm = devicePageTarget(view, "应用管理", "查询第三方应用，安装与卸载 APK");
+  const vm = devicePageTarget(view, "应用管理", "查询、打开第三方应用，安装与卸载 APK；仅操作当前指定 VM");
   if (!vm) return;
   const vmId = vm.id; // Capture identity before any asynchronous dialog or request.
   const panel = document.createElement("div"); panel.className = "panel";
@@ -1071,7 +1094,19 @@ function renderApps(view: HTMLElement) {
         } catch (error) { output(`${vmId}: 卸载失败: ${error}`, true); log(`${vmId}: 卸载失败: ${error}`, "err"); }
         finally { setBusy(false); }
       });
-      row.append(label, uninstall); list.appendChild(row);
+      const launch = document.createElement("button"); launch.className = "btn btn-sm"; launch.textContent = "打开";
+      launch.addEventListener("click", async () => {
+        if (busy || !panel.isConnected) return;
+        setBusy(true); output(`${vmId}: 正在打开 ${name}`);
+        try {
+          const result = await api.launchVmApp(vmId, name);
+          if (!result.ok) throw new Error(result.stderr || result.stdout || `exit=${result.code}`);
+          if (panel.isConnected) output(`${vmId}: 已发送应用启动请求 ${name}\n${result.stdout}`);
+          log(`${vmId}: 打开 ${name}；可手动刷新内部画面核对`, "info");
+        } catch (error) { if (panel.isConnected) output(`${vmId}: 打开失败: ${error}`, true); }
+        finally { setBusy(false); }
+      });
+      row.append(label, launch, uninstall); list.appendChild(row);
     }
     output(`${vmId}: 已连接 · ${packages.length} 个第三方应用`);
   };
@@ -1092,6 +1127,7 @@ function renderApps(view: HTMLElement) {
     } catch (error) { output(`${vmId}: 安装失败: ${error}`, true); log(`${vmId}: 安装失败: ${error}`, "err"); }
     finally { setBusy(false); }
   });
+  view.appendChild(createGuestPreview(vmId));
   setBusy(true); output(`${vmId}: 查询中`);
   refresh().catch((error) => output(`${vmId}: 查询失败: ${error}`, true)).finally(() => setBusy(false));
 }
@@ -1289,43 +1325,63 @@ async function deleteVm() {
 
 async function startVm() {
   const vm = state.vms.find((v) => v.id === state.currentVmId);
-  if (!vm) return;
-
-  log(`启动 ${vm.name}...`);
+  if (!vm || state.starting.has(vm.id) || state.running.has(vm.id)) return;
+  const session = Symbol(vm.id);
+  const headless = state.headless;
+  state.bootSessions.set(vm.id, session);
+  state.starting.add(vm.id);
+  const active = () => state.bootSessions.get(vm.id) === session;
+  paintView();
+  log(`启动 ${vm.name}（${headless ? "无窗口后台" : "模拟器窗口"}）...`);
   try {
-    const r = await api.launchVm(vm.id);
-    if (!r.ok) {
-      log(r.message, "err");
-      return;
-    }
-
+    const r = await api.launchVm(vm.id, headless);
+    if (!active()) return;
+    if (!r.ok) { log(r.message, "err"); return; }
     state.running.add(vm.id);
-    log(`${r.backend} 已启动 (PID ${r.pid}) · ${r.serial}；等待 Android/版本核验`, "ok");
-    state.vms = await api.listVms();
+    log(`${r.backend} 进程已创建 (PID ${r.pid}) · ${r.serial}；Android 尚待启动核验`, "info");
+    const launchedVms = await api.listVms();
+    if (!active()) return;
+    state.vms = launchedVms;
     paintView();
-
-    for (let i = 0; i < 40; i++) {
-      await new Promise((res) => setTimeout(res, 3000));
-      if (await api.adbConnect(vm.id)) {
-        log(`adb 已定向连接 ${r.serial}`, "ok");
-        for (let j = 0; j < 50; j++) {
-          const info = await api.adbDeviceInfo(vm.id);
-          if (info.model) {
-            log(`Android 就绪 · ${info.model} · API ${info.sdk} · ${info.abi}`, "ok");
-            if (info.root) log("检测到 root；版本仍待核验", "info");
-            try { const verified = await api.verifyVmRuntime(vm.id);
-              log(`版本核验 Root=${verified.root_verified} / LSP=${verified.lsp_verified}（${verified.lsp_state}）`, !verified.root_verified ? "err" : verified.pending_restart || !verified.lsp_verified ? "warn" : "ok");
-              state.vms = await api.listVms(); paintView(); return;
-            } catch (e) { log(`等待启动/核验: ${e}`, "info"); }
-          }
-          await new Promise((res) => setTimeout(res, 4000));
-        }
+    const deadline = Date.now() + 240_000;
+    let connected = false;
+    let lastWait = "等待指定设备上线";
+    while (Date.now() < deadline && active()) {
+      await new Promise((resolve) => setTimeout(resolve, 4000));
+      if (!active()) return;
+      const running = new Set(await api.runningVms());
+      if (!active()) return;
+      state.running = running;
+      if (!running.has(vm.id)) { log(`${vm.name} 进程已退出；请查看启动日志`, "err"); return; }
+      try {
+        if (!await api.adbConnect(vm.id)) continue;
+        if (!active()) return;
+        if (!connected) { log(`ADB 已定向连接 ${r.serial}；不等同于系统已启动`, "info"); connected = true; }
+        const boot = await api.vmBootStatus(vm.id);
+        if (!active()) return;
+        if (boot.serial !== r.serial) throw new Error("启动核验返回了不同设备身份");
+        if (!boot.boot_completed) { lastWait = "指定设备已连接，等待sys.boot_completed=1"; continue; }
+        const info = await api.adbDeviceInfo(vm.id);
+        if (!active()) return;
+        if (!info.connected || info.serial !== r.serial) { lastWait = "启动属性读取未确认指定设备"; continue; }
+        log(`Android 启动核验完成 · ${info.model} · API ${info.sdk} · ${info.abi}`, "ok");
+        log("Root/LSPosed尚未在本次启动核验；如需Root，请在内部画面点击“请求Shell Root”，明确授权后再点版本验证", "info");
+        const readyVms = await api.listVms();
+        if (!active()) return;
+        state.vms = readyVms;
+        paintView();
         return;
-      }
+      } catch (e) { lastWait = String(e); }
     }
-    log("adb 连接超时", "warn");
+    if (active()) log(`Android 启动核验超时：${lastWait}；进程运行状态不作为启动成功`, "warn");
   } catch (e) {
-    log(`启动失败: ${e}`, "err");
+    if (active()) log(`启动失败: ${e}`, "err");
+  } finally {
+    if (active()) {
+      state.bootSessions.delete(vm.id);
+      state.starting.delete(vm.id);
+      paintView();
+    }
   }
 }
 
@@ -1333,6 +1389,8 @@ async function stopVm() {
   const vm = state.vms.find((v) => v.id === state.currentVmId);
   if (!vm) return;
 
+  state.bootSessions.delete(vm.id);
+  state.starting.delete(vm.id);
   try {
     const msg = await api.stopVm(vm.id);
     state.running.delete(vm.id);
@@ -1361,26 +1419,22 @@ async function init() {
     log(`后端连接失败: ${e}`, "err");
   }
 
+  // Local VM controls must not depend on GitHub or mirror availability.
   try {
     state.vms = await api.listVms();
-    state.overlays = await api.listOverlays();
-    await loadManagers();
-    try { state.lsp = await api.listLsposed(); } catch {}
-    try { state.aospImages = await api.listAospImages(); } catch {}
     state.currentVmId = state.vms[0]?.id ?? null;
     state.running = new Set(await api.runningVms());
-
-    const dlCount = state.managers.reduce(
-      (n, m) => n + m.versions.filter((v) => v.downloaded).length, 0
-    );
-    log(
-      `载入 ${state.vms.length} 个虚拟机 · ${state.managers.length} 个管理器 · ${dlCount} 个已下载版本`,
-      "ok"
-    );
+    log(`已载入 ${state.vms.length} 个本地虚拟机；在线版本列表后台刷新`, "ok");
     paintView();
   } catch (e) {
-    log(`数据加载失败: ${e}`, "err");
+    log(`本地虚拟机加载失败: ${e}`, "err");
   }
+  await Promise.allSettled([
+    (async () => { state.overlays = await api.listOverlays(); paintView(); })(),
+    (async () => { await loadManagers(); paintView(); })(),
+    (async () => { state.lsp = await api.listLsposed(); paintView(); })(),
+    (async () => { state.aospImages = await api.listAospImages(); paintView(); })(),
+  ]);
 }
 
 init();

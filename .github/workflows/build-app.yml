@@ -46,6 +46,28 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Install locked frontend dependencies
         run: pnpm install --frozen-lockfile
+      - name: Test guest click coordinate mapping without launching a VM
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $resultDir = Join-Path $env:GITHUB_WORKSPACE 'build-evidence'
+          New-Item -ItemType Directory -Force $resultDir | Out-Null
+          & node --test scripts/guest-coordinates.test.mjs scripts/guest-request-gate.test.mjs scripts/boot-flow.test.mjs 2>&1 |
+            Tee-Object -FilePath (Join-Path $resultDir 'guest-coordinate-tests.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Guest coordinate regression tests failed' }
+      - name: Test LSPosed disable staging with filesystem fixtures only
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $resultDir = Join-Path $env:GITHUB_WORKSPACE 'build-evidence'
+          New-Item -ItemType Directory -Force $resultDir | Out-Null
+          $gitExe = (Get-Command git.exe -ErrorAction Stop).Source
+          $gitRoot = Split-Path (Split-Path $gitExe -Parent) -Parent
+          $bashCandidates = @((Join-Path $gitRoot 'bin/bash.exe'), (Join-Path $gitRoot 'usr/bin/bash.exe'))
+          $bashPath = $bashCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $bashPath) { throw 'Git Bash fixture shell not found under selected Git installation' }
+          $env:ROOST_FIXTURE_SHELL = $bashPath
+          & node --test scripts/disable-lsposed.test.mjs 2>&1 |
+            Tee-Object -FilePath (Join-Path $resultDir 'disable-lsposed-tests.log')
+          if ($LASTEXITCODE -ne 0) { throw 'LSPosed disable staging regression tests failed' }
       - name: Check frontend types and build assets
         run: pnpm build
       - name: Check locked Rust dependencies and types
@@ -64,6 +86,8 @@ jobs:
           if ($testExit -ne 0) { throw "Rust regression tests failed: exit=$testExit" }
       - name: Build Windows installer
         run: pnpm tauri build --bundles nsis -- --locked
+      - name: Verify windowless JSONL control without launching a VM
+        run: node scripts/headless-smoke.mjs
       - name: Record source revision and artifact hashes
         run: |
           $ErrorActionPreference = 'Stop'

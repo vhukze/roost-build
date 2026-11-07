@@ -81,8 +81,19 @@ export interface LaunchResult {
 export interface PreparedBoot { root: string; key: string; source: string; sha256: string; ramdisk: string }
 
 export interface CmdResult { ok: boolean; stdout: string; stderr: string; code: number }
+export interface CaptureVmGuestResult {
+  vm_id: string;
+  serial: string;
+  png_base64: string;
+  width: number;
+  height: number;
+  sha256: string;
+  source: "guest";
+  captured_at: string;
+  boot_id: string;
+}
 export interface ModuleInstallResult extends CmdResult { needs_reboot: boolean; module_id: string }
-export interface VerifyVmResult { root_verified: boolean; lsp_verified: boolean; lsp_installed: boolean; lsp_state: string; pending_restart: boolean; message: string }
+export interface VerifyVmResult { root_verified: boolean; lsp_verified: boolean; lsp_installed: boolean; lsp_state: string; pending_restart: boolean; message: string; boot_id: string }
 
 export interface DeviceInfo {
   connected: boolean;
@@ -93,6 +104,7 @@ export interface DeviceInfo {
   abi: string;
   debuggable: string;
   root: boolean;
+  root_checked: boolean;
 }
 
 export interface SwitchResult {
@@ -162,8 +174,14 @@ export const api = {
 
   // ADB
   adbConnect: (vmId: string) => invoke<boolean>("adb_connect", { vmId }),
+  vmBootStatus: (vmId: string) => invoke<{ boot_completed: boolean; serial: string }>("vm_boot_status", { vmId }),
+  requestVmRoot: (vmId: string) => invoke<CmdResult>("request_vm_root", { vmId }),
   adbDeviceInfo: (vmId: string) => invoke<DeviceInfo>("adb_device_info", { vmId }),
   adbListPackages: (vmId: string) => invoke<string[]>("adb_list_packages", { vmId }),
+  captureVmGuest: (vmId: string) => invoke<CaptureVmGuestResult>("capture_vm_guest", { vmId }),
+  tapVmGuest: (vmId: string, x: number, y: number, expectedWidth: number, expectedHeight: number, expectedBootId: string) =>
+    invoke<CmdResult>("tap_vm_guest", { vmId, x, y, expectedWidth, expectedHeight, expectedBootId }),
+  launchVmApp: (vmId: string, packageName: string) => invoke<CmdResult>("launch_vm_app", { vmId, packageName }),
   adbInstall: (vmId: string, apk: string) => invoke<CmdResult>("adb_install", { vmId, apk }),
   adbUninstall: (vmId: string, packageName: string) =>
     invoke<CmdResult>("adb_uninstall", { vmId, package: packageName }),
