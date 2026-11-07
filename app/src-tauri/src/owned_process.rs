@@ -157,11 +157,15 @@ mod tests {
         if role == "parent" {
             let stdout = fs::File::create(dir.join("grandchild.stdout")).unwrap();
             let stderr = fs::File::create(dir.join("grandchild.stderr")).unwrap();
+            use std::os::windows::process::CommandExt;
             let grandchild = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--ignored", "--exact", WORKER, "--nocapture", "--test-threads=1"])
                 .env("ROOST_JOB_FIXTURE_ROLE", "grandchild")
                 .env("ROOST_JOB_FIXTURE_DIR", &dir)
                 .stdin(Stdio::null()).stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr))
+                // The fixture is a console test executable. Avoid creating a
+                // conhost descendant that would make the expected Job size 2.
+                .creation_flags(0x0800_0000)
                 .spawn().expect("spawn fixture grandchild");
             fs::write(dir.join("grandchild.pid"), grandchild.id().to_string()).unwrap();
             // Dropping std::process::Child keeps the descendant alive so the Job
