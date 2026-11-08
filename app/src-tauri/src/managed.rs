@@ -1084,9 +1084,24 @@ async fn install_zip_checked(adb: &Adb, c: &VmConfig, path: &str, selection: Opt
     // post-fs-data module scripts run. Restore from this copy at the earliest hook.
     let backup = format!("/data/adb/roost-module-backups/{module_id}");
     let restore = format!("/data/adb/post-fs-data.d/roost-restore-{module_id}.sh");
-    let restore_cmd = format!(
-        "set -e; mkdir -p /data/adb/roost-module-backups; rm -rf {backup}; mkdir -p {backup}; cp -a /data/adb/modules/{module_id}/. {backup}/; mkdir -p /data/adb/post-fs-data.d; cat > {restore} <<'ROOST_RESTORE_EOF\\n#!/system/bin/sh\\nset -e\\nbackup={backup}\\ntarget=/data/adb/modules/{module_id}\\n[ -d \\\"$backup\\\" ] || exit 0\\nrm -rf \\\"$target\\\"\\nmkdir -p \\\"$target\\\"\\ncp -a \\\"$backup\\\"/. \\\"$target\\\"/\\nROOST_RESTORE_EOF\\nchmod 755 {restore}; test -s {backup}/module.prop; test -s {restore}");
-    let backup_result = adb.su_shell(&restore_cmd).await?;
+    // The restore script is staged as a file: a multi-line heredoc inside su -c
+    // broke shell quoting on this guest ("no closing quote"). Push, then place it.
+    let local_stage = std::env::temp_dir().join(format!("roost-restore-{module_id}-{}.sh",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
+    let script = format!("#!/system/bin/sh\nset -e\nbackup={backup}\ntarget=/data/adb/modules/{module_id}\n[ -d \"$backup\" ] || exit 0\nrm -rf \"$target\"\nmkdir -p \"$target\"\ncp -a \"$backup\"/. \"$target\"/\n");
+    std::fs::write(&local_stage, script)?;
+    let remote_stage = format!("/data/local/tmp/roost-restore-{module_id}.sh");
+    let backup_result: Result<CmdResult> = async {
+        require_ok(adb.push(&local_stage.to_string_lossy(), &remote_stage).await?)?;
+        require_ok(adb.su_shell(&format!("mkdir -p /data/adb/roost-module-backups {backup}")).await?)?;
+        require_ok(adb.su_shell(&format!("cp -a /data/adb/modules/{module_id}/. {backup}/")).await?)?;
+        require_ok(adb.su_shell("mkdir -p /data/adb/post-fs-data.d").await?)?;
+        require_ok(adb.su_shell(&format!("cp {remote_stage} {restore} && chmod 755 {restore} && chmod 755 /data/adb/post-fs-data.d")).await?)?;
+        require_ok(adb.su_shell(&format!("test -s {backup}/module.prop && test -s {restore}")).await?)
+    }.await;
+    let _ = std::fs::remove_file(&local_stage);
+    let _ = adb.shell(&format!("rm -f {remote_stage}")).await;
+    let backup_result = backup_result?;
     if !backup_result.ok {
         return Err(Error::Other(format!("模块启动恢复副本创建失败；未标记待重启。{}", backup_result.output())));
     }
