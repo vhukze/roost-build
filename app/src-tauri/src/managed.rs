@@ -1079,25 +1079,24 @@ async fn install_zip_checked(adb: &Adb, c: &VmConfig, path: &str, selection: Opt
     }
     let state = adb.su_shell(&format!("test -s /data/adb/modules/{module_id}/module.prop")).await?;
     if !state.ok { return Err(Error::Other(format!("安装器退出成功但未发现可用模块 {module_id}；{}", result.output()))); }
-    // Keep an immutable guest-side copy outside Magisk's module tree. On this guest,
-    // Magisk's next-boot module migration truncates most files to zero bytes before
-    // post-fs-data module scripts run. Restore from this copy at the earliest hook.
-    let backup = format!("/data/adb/roost-module-backups/{module_id}");
-    let restore = format!("/data/adb/post-fs-data.d/roost-restore-{module_id}.sh");
+    // Magisk on this guest wipes the module directory contents during boot, and it also
+    // deleted a backup directory whose name matched the module id. Store the payload as a
+    // single archive under a name that cannot collide with any module id, then restore it
+    // from an early boot hook that lives outside the module tree.
+    let backup = format!("/data/adb/roost-mb-{}.tar", &digest[..16]);
+    let restore = format!("/data/adb/post-fs-data.d/roost-rb-{}.sh", &digest[..16]);
     // The restore script is staged as a file: a multi-line heredoc inside su -c
     // broke shell quoting on this guest ("no closing quote"). Push, then place it.
-    let local_stage = std::env::temp_dir().join(format!("roost-restore-{module_id}-{}.sh",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
-    let script = format!("#!/system/bin/sh\nset -e\nbackup={backup}\ntarget=/data/adb/modules/{module_id}\n[ -d \"$backup\" ] || exit 0\nrm -rf \"$target\"\nmkdir -p \"$target\"\ncp -a \"$backup\"/. \"$target\"/\n");
+    let local_stage = std::env::temp_dir().join(format!("roost-rb-{}.sh", &digest[..16]));
+    let script = format!("#!/system/bin/sh\nset -e\nsrc={backup}\ntarget=/data/adb/modules/{module_id}\ntmp=/data/adb/roost-rt-{0}\n[ -s \"$src\" ] || exit 0\nrm -rf \"$tmp\"\nmkdir -p \"$tmp\"\ntar -xf \"$src\" -C \"$tmp\"\n[ -s \"$tmp/module.prop\" ] || exit 0\nrm -rf \"$target\"\nmkdir -p \"$target\"\ncp -a \"$tmp\"/. \"$target\"/\nrm -rf \"$tmp\"\n", &digest[..16]);
     std::fs::write(&local_stage, script)?;
-    let remote_stage = format!("/data/local/tmp/roost-restore-{module_id}.sh");
+    let remote_stage = format!("/data/local/tmp/roost-rb-{}.sh", &digest[..16]);
     let backup_result: Result<CmdResult> = async {
         require_ok(adb.push(&local_stage.to_string_lossy(), &remote_stage).await?)?;
-        require_ok(adb.su_shell(&format!("mkdir -p /data/adb/roost-module-backups {backup}")).await?)?;
-        require_ok(adb.su_shell(&format!("cp -a /data/adb/modules/{module_id}/. {backup}/")).await?)?;
+        require_ok(adb.su_shell(&format!("( cd /data/adb/modules/{module_id} && tar -cf {backup} . )")).await?)?;
         require_ok(adb.su_shell("mkdir -p /data/adb/post-fs-data.d").await?)?;
         require_ok(adb.su_shell(&format!("cp {remote_stage} {restore} && chmod 755 {restore} && chmod 755 /data/adb/post-fs-data.d")).await?)?;
-        require_ok(adb.su_shell(&format!("test -s {backup}/module.prop && test -s {restore}")).await?)
+        require_ok(adb.su_shell(&format!("test -s {backup} && test -s {restore}")).await?)
     }.await;
     let _ = std::fs::remove_file(&local_stage);
     let _ = adb.shell(&format!("rm -f {remote_stage}")).await;
