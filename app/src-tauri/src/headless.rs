@@ -113,6 +113,8 @@ fn parse_request(bytes: &[u8]) -> Result<Request> {
 }
 
 /// BufRead::lines may allocate an unbounded line before returning. Bound first.
+/// Blank lines are skipped: a caller that writes several requests at once can leave
+/// stray separators, and an empty frame must never be parsed as JSON.
 fn read_request_line(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
@@ -133,6 +135,7 @@ fn read_request_line(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
         if ended {
             line.pop();
             if line.last() == Some(&b'\r') { line.pop(); }
+            if line.is_empty() { continue; }
             return Ok(Some(line));
         }
     }
