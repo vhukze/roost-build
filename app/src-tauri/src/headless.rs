@@ -71,7 +71,17 @@ pub fn dispatch(args: impl IntoIterator<Item = OsString>) -> Option<i32> {
     };
     let stdin = io::stdin();
     let stdout = io::stdout();
-    Some(runtime.block_on(session.run(&mut stdin.lock(), &mut stdout.lock())))
+    // Read the whole request stream up front. Launching the emulator spawns adb children
+    // that can disturb the inherited stdin handle on Windows, after which a live read
+    // returned an empty buffer and the next frame failed to parse. Buffering here keeps
+    // the protocol independent of any child process behaviour.
+    let mut pending = Vec::new();
+    if let Err(error) = io::Read::read_to_end(&mut stdin.lock(), &mut pending) {
+        startup_error(&format!("stdin: {error}"));
+        return Some(1);
+    }
+    let mut reader = io::Cursor::new(pending);
+    Some(runtime.block_on(session.run(&mut reader, &mut stdout.lock())))
 }
 
 fn startup_error(message: &str) {
