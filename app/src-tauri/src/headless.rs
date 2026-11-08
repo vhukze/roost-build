@@ -126,28 +126,19 @@ fn parse_request(bytes: &[u8]) -> Result<Request> {
 /// Blank lines are skipped: a caller that writes several requests at once can leave
 /// stray separators, and an empty frame must never be parsed as JSON.
 fn read_request_line(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
-    let mut line = Vec::new();
     loop {
-        let (count, ended) = {
-            let available = reader.fill_buf()?;
-            if available.is_empty() {
-                return if line.is_empty() { Ok(None) } else { Ok(Some(line)) };
-            }
-            let count = available.iter().position(|byte| *byte == b'\n')
-                .map(|index| index + 1).unwrap_or(available.len());
-            if line.len() + count > MAX_REQUEST_BYTES {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "JSONL request exceeds 16KiB"));
-            }
-            line.extend_from_slice(&available[..count]);
-            (count, available[count - 1] == b'\n')
-        };
-        reader.consume(count);
-        if ended {
-            line.pop();
-            if line.last() == Some(&b'\r') { line.pop(); }
-            if line.is_empty() { continue; }
-            return Ok(Some(line));
+        let mut line = Vec::new();
+        match reader.read_until(b'\n', &mut line)? {
+            0 => return Ok(None),
+            _ => {}
         }
+        if line.last() == Some(&b'\n') { line.pop(); }
+        if line.last() == Some(&b'\r') { line.pop(); }
+        if line.len() > MAX_REQUEST_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "JSONL request exceeds 16KiB"));
+        }
+        if line.is_empty() { continue; }
+        return Ok(Some(line));
     }
 }
 
