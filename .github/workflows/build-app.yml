@@ -84,7 +84,12 @@ jobs:
             Tee-Object -FilePath (Join-Path $resultDir 'rust-tests.log')
           $testExit = $LASTEXITCODE
           if ($testExit -ne 0) { throw "Rust regression tests failed: exit=$testExit" }
-      - name: Build Windows installer
+      - name: Build application binary
+        run: pnpm tauri build --no-bundle -- --locked
+      - name: Build NSIS installer
+        # Packaging downloads NSIS helper binaries from GitHub, which has returned 504.
+        # A packaging outage must not hide the already-built application binary.
+        continue-on-error: true
         run: pnpm tauri build --bundles nsis -- --locked
       - name: Verify windowless JSONL control without launching a VM
         run: node scripts/headless-smoke.mjs
@@ -94,9 +99,10 @@ jobs:
           $resultDir = Join-Path $env:GITHUB_WORKSPACE 'build-evidence'
           New-Item -ItemType Directory -Force $resultDir | Out-Null
           Set-Content -Encoding UTF8 (Join-Path $resultDir 'revision.txt') $env:GITHUB_SHA
-          $installers = @(Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe)
-          if ($installers.Count -eq 0) { throw 'NSIS installer not produced' }
-          $files = @($installers) + @(Get-Item src-tauri/target/release/droidbox.exe)
+          $binary = Get-Item src-tauri/target/release/droidbox.exe
+          if (-not $binary) { throw 'application binary not produced' }
+          $installers = @(Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue)
+          $files = @($binary) + $installers
           $files | Get-FileHash -Algorithm SHA256 | Select-Object Path,Hash |
             ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $resultDir 'sha256.json')
       - name: Upload regression logs even when the build fails
@@ -110,6 +116,7 @@ jobs:
             build-evidence/*
             ${{ runner.temp }}/roost-job-test-*/*
       - name: Upload installer and build evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: roost-windows-${{ github.sha }}
@@ -118,4 +125,5 @@ jobs:
           path: |
             app/src-tauri/target/release/bundle/nsis/*.exe
             app/src-tauri/target/release/droidbox.exe
+            build-evidence/*
             build-evidence/*
