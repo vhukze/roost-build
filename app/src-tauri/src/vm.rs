@@ -205,11 +205,11 @@ impl VmManager {
 
             self.ensure_disk(&config).await?;
         }
-        crate::managed::prepare_boot(&config)?;
+        crate::managed::prepare_boot(&config).map_err(|error| Error::Other(format!("prepare_boot: {error}")))?;
         let args = if config.backend == "android-emulator" {
-            crate::managed::check_acceleration(&config).await?;
-            crate::managed::prepare_emulator_data(&config)?;
-            crate::managed::emulator_command(&config, headless)?
+            crate::managed::check_acceleration(&config).await.map_err(|error| Error::Other(format!("check_acceleration: {error}")))?;
+            crate::managed::prepare_emulator_data(&config).map_err(|error| Error::Other(format!("prepare_emulator_data: {error}")))?;
+            crate::managed::emulator_command(&config, headless).map_err(|error| Error::Other(format!("emulator_command: {error}")))?
         } else { config.build_command(headless) };
         let exe = &args[0];
         let rest = &args[1..];
