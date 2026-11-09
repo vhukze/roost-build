@@ -275,7 +275,8 @@ impl Session {
         }
         let desired = self.bound_config()?;
         if operation == Operation::Launch {
-            let result = self.manager.launch_captured(desired, true).await?;
+            let result = self.manager.launch_captured(desired, true).await
+                .map_err(|error| Error::Other(format!("launch: {error}")))?;
             if !result.ok { return Err(Error::Other(result.message)); }
             if result.serial != self.serial {
                 return Err(Error::Other("Launch serial differs from session binding".into()));
