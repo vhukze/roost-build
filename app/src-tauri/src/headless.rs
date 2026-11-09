@@ -84,6 +84,16 @@ pub fn dispatch(args: impl IntoIterator<Item = OsString>) -> Option<i32> {
     Some(runtime.block_on(session.run(&mut reader, &mut stdout.lock())))
 }
 
+/// How long a status request may wait for the guest before reporting its observation.
+/// Bounded so a batch of polls never runs ahead of real boot progress.
+fn status_dwell_ms() -> u64 {
+    std::env::var("ROOST_STATUS_DWELL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.min(30_000))
+        .unwrap_or(5_000)
+}
+
 fn startup_error(message: &str) {
     let _ = write_json(&mut io::stdout().lock(), &json!({
         "protocol": PROTOCOL, "event": "fatal", "ok": false, "error": message,
@@ -259,6 +269,22 @@ impl Session {
                 return Ok(json!({ "stopped": true, "message": message }));
             }
             Operation::Status => {
+                // A batch of status requests is issued back to back, so a single fast probe
+                // would sample the guest before it finishes booting. Waiting briefly here
+                // makes each poll span real time and keeps the whole sequence in one process,
+                // which is required because the owned process tree lives with this session.
+                let wait_ms = status_dwell_ms();
+                if wait_ms > 0 {
+                    let running_now = self.manager.is_running(&self.vm_id);
+                    if running_now {
+                        if let Ok((_, adb)) = self.owned_adb() {
+                            if adb.is_booted().await {
+                                return Ok(status_payload(true, true, Some(true)));
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                    }
+                }
                 let running = self.manager.is_running(&self.vm_id);
                 let owned = self.owns_vm();
                 // Poll only the exact serial held by this manager. ADB offline,
